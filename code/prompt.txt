@@ -1,4 +1,0 @@
-Write a n=5 way k=1 shot machine learning code that uses the Omniglot dataset using memory augmented neuro network method. Make sure that your code runs on gpu. Also, please make the memory part easy to change its value so that you can add gaussian noise in the vectors inside memory. Remember to do testing on the data set and report the accuracy. I want a result of comparison between "Training without noisy-embeddings, but test on noisy input embeddings" and "Training with noisy-embeddings, test on noisy input embeddings".
-
-
-
