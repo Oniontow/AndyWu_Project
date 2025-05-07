@@ -23,7 +23,7 @@ N_WAY = 5
 K_SHOT = 1
 N_QUERY = 5
 NUM_EPOCHS = 100
-EPISODES_PER_EPOCH = 50
+EPISODES_PER_EPOCH = 20
 TEST_EPISODES = 500
 NOISE_STD_MIN = 1
 NOISE_LEVELS = np.concatenate([np.linspace(0, 9, 10), np.logspace(1, 3, 21)])
@@ -351,6 +351,53 @@ def l1_distance(a, b):
     dist = torch.sum(torch.abs(a.unsqueeze(1) - b.unsqueeze(0)), dim=2)
     return -dist
 
+def l1_similarity_for_training(a, b):
+    """
+    可訓練的L1相似度函數 - 將L1距離轉換為相似度分數
+    這個函數會返回相似度而非距離，以便用於訓練
+    """
+    # 計算L1距離
+    distances = torch.sum(torch.abs(a.unsqueeze(1) - b.unsqueeze(0)), dim=2)
+    
+    # 將距離歸一化為相似度分數 (0-1範圍)，方便訓練
+    # 使用批次內的最大距離進行歸一化
+    max_dist = torch.max(distances) + 1e-8
+    similarities = 1.0 - distances / max_dist
+    
+    return similarities
+
+def linf_similarity_for_training(a, b, iterations=300, temperature=10.0):
+    """
+    改進的L-infinity相似度函數 - 使用多層softmax加強對最大差異的敏感度
+    
+    Args:
+        a, b: 嵌入向量
+        iterations: softmax疊加的次數
+        temperature: softmax溫度參數，控制軟化程度
+    """
+    # 計算絕對差異
+    abs_diff = torch.abs(a.unsqueeze(1) - b.unsqueeze(0))  # [query_size, support_size, dim]
+    
+    # 對每個維度進行多次softmax處理，加強對最大差異的敏感度
+    # 先將差異矩陣轉置，使維度在前面，便於對每對向量的所有維度應用softmax
+    # [query_size, support_size, dim] -> [query_size, support_size, dim]
+    weights = abs_diff.clone()
+    
+    # 多次應用softmax，每次都會進一步強化最大值
+    for _ in range(iterations):
+        # 在維度方向應用softmax
+        weights = F.softmax(weights * temperature, dim=2)
+    
+    # 加權平均，注重最大差異的維度
+    # 使用weights作為注意力，強調最大差異的維度
+    weighted_diff = (abs_diff * weights).sum(dim=2)
+    
+    # 歸一化為相似度分數
+    max_value = torch.max(weighted_diff) + 1e-8
+    similarities = 1.0 - weighted_diff / max_value
+    
+    return similarities
+
 # -------------------------------
 # Data Utilities
 # -------------------------------
@@ -474,6 +521,195 @@ def visualize_tsne_embeddings(model, data_by_class, n_way, k_shot, n_query, dist
         
         plt.tight_layout()
         plt.savefig(f"tsne_{DATASET}_N{n_way}_K{k_shot}_Q{n_query}.png", dpi=300, bbox_inches='tight')
+        plt.show()
+        
+def visualize_tsne_for_different_training_metrics(trained_models, model_names, data_by_class, n_way, k_shot, n_query, distance_fns):
+    """
+    使用t-SNE比較不同訓練度量的嵌入空間結構
+    
+    Args:
+        trained_models: 使用不同度量訓練的模型列表
+        model_names: 模型名稱列表 (訓練度量名稱)
+        data_by_class: 按類別組織的數據
+        n_way, k_shot, n_query: 任務設定
+        distance_fns: 要測試的距離函數
+    """
+    # 採樣一個固定的episode，用於所有模型的比較
+    support_imgs, support_labels, query_imgs, query_labels = sample_episode(data_by_class, n_way, k_shot, n_query)
+    support_imgs, support_labels = support_imgs.to(DEVICE), support_labels.to(DEVICE)
+    query_imgs, query_labels = query_imgs.to(DEVICE), query_labels.to(DEVICE)
+    
+    # 準備標籤
+    all_labels = torch.cat([support_labels, query_labels]).cpu().numpy()
+    is_query = np.concatenate([np.zeros(len(support_labels)), np.ones(len(query_labels))])
+    
+    # 為每個模型創建一個大圖
+    for model_idx, (model, model_name) in enumerate(zip(trained_models, model_names)):
+        model.eval()
+        print(f"\n正在為 {model_name} 訓練的模型生成t-SNE可視化...")
+        
+        with torch.no_grad():
+            # 獲取嵌入向量
+            support_emb = model(support_imgs)
+            query_emb = model(query_imgs)
+            
+            # 量化嵌入向量
+            all_embs_original = torch.cat([support_emb, query_emb], dim=0)
+            abs_max = torch.max(torch.abs(all_embs_original)).item()
+            scale = 127.0 / (abs_max + 1e-8)
+            
+            quantized_embs, _ = quantize_to_int8(all_embs_original, scale)
+            all_embs = dequantize_from_int8(quantized_embs, scale)
+            all_embs_np = all_embs.cpu().numpy()
+            original_embs_np = all_embs_original.cpu().numpy()
+            
+            # 計算距離矩陣
+            distance_matrices = []
+            for dist_name, dist_fn in distance_fns:
+                if dist_name == "Cosine (No Quant)":
+                    # 使用原始嵌入向量
+                    scores = dist_fn(torch.from_numpy(original_embs_np).to(DEVICE), 
+                                    torch.from_numpy(original_embs_np).to(DEVICE)).cpu().numpy()
+                    distances = 1.0 - scores
+                    distances = np.maximum(distances, 0.0)
+                elif dist_name == "Cosine":
+                    # 使用量化後的嵌入向量
+                    scores = dist_fn(torch.from_numpy(all_embs_np).to(DEVICE), 
+                                    torch.from_numpy(all_embs_np).to(DEVICE)).cpu().numpy()
+                    distances = 1.0 - scores
+                    distances = np.maximum(distances, 0.0)
+                else:
+                    # 其他距離度量
+                    scores = dist_fn(torch.from_numpy(all_embs_np).to(DEVICE), 
+                                    torch.from_numpy(all_embs_np).to(DEVICE)).cpu().numpy()
+                    distances = -scores
+                    distances = distances - np.min(distances)
+                
+                # 確保沒有負值
+                if np.any(distances < 0):
+                    distances = np.maximum(distances, 0.0)
+                    
+                distance_matrices.append((dist_name, distances))
+            
+            # 為每種距離度量創建t-SNE可視化
+            plt.figure(figsize=(len(distance_fns)*6, 12))
+            
+            for idx, (dist_name, distances) in enumerate(distance_matrices):
+                # t-SNE降維
+                tsne = TSNE(n_components=2, 
+                    metric="precomputed", 
+                    init="random",
+                    perplexity=15,
+                    random_state=42,
+                    n_iter=2000,
+                    learning_rate="auto")
+                tsne_result = tsne.fit_transform(distances)
+                
+                # 繪製結果
+                ax = plt.subplot(1, len(distance_fns), idx+1)
+                ax.grid(True, linestyle='--', alpha=0.7)
+                ax.set_frame_on(True)
+                
+                # 創建顏色映射
+                cmap = plt.cm.get_cmap('tab10', n_way)
+                
+                # 分別繪製support和query點
+                for class_idx in range(n_way):
+                    # Support points
+                    mask_support = (all_labels == class_idx) & (is_query == 0)
+                    plt.scatter(tsne_result[mask_support, 0], tsne_result[mask_support, 1], 
+                              c=[cmap(class_idx)], marker='o', s=100, 
+                              label=f"Support {class_idx}" if idx == 0 else None)
+                    
+                    # Query points
+                    mask_query = (all_labels == class_idx) & (is_query == 1)
+                    plt.scatter(tsne_result[mask_query, 0], tsne_result[mask_query, 1], 
+                              c=[cmap(class_idx)], marker='x', s=100, 
+                              label=f"Query {class_idx}" if idx == 0 else None)
+                
+                plt.title(f"{model_name} - {dist_name}", fontsize=14)
+            
+            # 添加圖例
+            if len(distance_matrices) > 0:
+                plt.figlegend(loc="upper center", bbox_to_anchor=(0.5, 0), ncol=n_way*2)
+            
+            plt.tight_layout()
+            plt.savefig(f"tsne_{model_name.lower().replace(' ', '_').replace('-', '_')}_{DATASET}.png", dpi=300, bbox_inches='tight')
+            plt.show()
+    
+    # 為每種距離度量創建不同訓練方法的比較圖
+    for dist_idx, (dist_name, _) in enumerate(distance_fns):
+        plt.figure(figsize=(len(trained_models)*5, 10))
+        print(f"\n為 {dist_name} 距離度量創建不同訓練方法的比較...")
+        
+        for model_idx, (model, model_name) in enumerate(zip(trained_models, model_names)):
+            model.eval()
+            
+            with torch.no_grad():
+                # 獲取嵌入向量
+                support_emb = model(support_imgs)
+                query_emb = model(query_imgs)
+                
+                # 量化嵌入向量
+                all_embs_original = torch.cat([support_emb, query_emb], dim=0)
+                abs_max = torch.max(torch.abs(all_embs_original)).item()
+                scale = 127.0 / (abs_max + 1e-8)
+                
+                quantized_embs, _ = quantize_to_int8(all_embs_original, scale)
+                all_embs = dequantize_from_int8(quantized_embs, scale)
+                all_embs_np = all_embs.cpu().numpy()
+                original_embs_np = all_embs_original.cpu().numpy()
+                
+                # 計算特定距離度量的距離矩陣
+                dist_fn = distance_fns[dist_idx][1]
+                if dist_name == "Cosine (No Quant)":
+                    scores = dist_fn(torch.from_numpy(original_embs_np).to(DEVICE), 
+                                   torch.from_numpy(original_embs_np).to(DEVICE)).cpu().numpy()
+                    distances = 1.0 - scores
+                else:
+                    scores = dist_fn(torch.from_numpy(all_embs_np).to(DEVICE), 
+                                   torch.from_numpy(all_embs_np).to(DEVICE)).cpu().numpy()
+                    distances = 1.0 - scores if dist_name == "Cosine" else -scores
+                
+                # 確保沒有負值
+                if np.any(distances < 0):
+                    distances = distances - np.min(distances)
+                
+                # t-SNE降維
+                tsne = TSNE(n_components=2, 
+                    metric="precomputed", 
+                    init="random",
+                    perplexity=15,
+                    random_state=42,
+                    n_iter=2000,
+                    learning_rate="auto")
+                tsne_result = tsne.fit_transform(distances)
+                
+                # 繪製結果
+                ax = plt.subplot(1, len(trained_models), model_idx+1)
+                ax.grid(True, linestyle='--', alpha=0.7)
+                
+                # 分別繪製support和query點
+                for class_idx in range(n_way):
+                    # Support points
+                    mask_support = (all_labels == class_idx) & (is_query == 0)
+                    plt.scatter(tsne_result[mask_support, 0], tsne_result[mask_support, 1], 
+                              c=[cmap(class_idx)], marker='o', s=100, 
+                              label=f"Support {class_idx}" if model_idx == 0 else None)
+                    
+                    # Query points
+                    mask_query = (all_labels == class_idx) & (is_query == 1)
+                    plt.scatter(tsne_result[mask_query, 0], tsne_result[mask_query, 1], 
+                              c=[cmap(class_idx)], marker='x', s=100, 
+                              label=f"Query {class_idx}" if model_idx == 0 else None)
+                
+                plt.title(f"{dist_name} - {model_name}", fontsize=14)
+        
+        # 添加圖例
+        plt.figlegend(loc="upper center", bbox_to_anchor=(0.5, 0), ncol=n_way*2)
+        
+        plt.tight_layout()
+        plt.savefig(f"tsne_comparison_{dist_name.lower().replace(' ', '_').replace('(', '').replace(')', '')}_{DATASET}.png", dpi=300, bbox_inches='tight')
         plt.show()
 
 # 添加量化相關函數
@@ -715,89 +951,182 @@ test_data = organize_by_class(test_dataset)
 # Main Experiment Loop
 # -------------------------------
 distance_fns = [
-    ("Cosine (No Quant)", cosine_similarity),  # 新增：未量化的餘弦相似度
+    ("Cosine (No Quant)", cosine_similarity),  
     ("Cosine", cosine_similarity),
     ("L-1", l1_distance),
-    ("L-inf", linf_distance),
-    ("Hamming", hamming_distance)
+    ("L-inf", linf_distance)
 ]
 
-results = np.zeros((len(distance_fns), NUM_ITER_AVG))
+# results = np.zeros((len(distance_fns), NUM_ITER_AVG))
 
-for it in range(NUM_ITER_AVG):
-    # Train a model using cosine similarity
-    if DATASET in ['omniglot', 'mnist']:
-        model = MANN(dataset=DATASET, quantize=False, out_dim = OUTPUT_DIM).to(DEVICE)
-    else:
-        model = EnhancedMANN(dataset=DATASET, quantize=False, out_dim = OUTPUT_DIM).to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    train_model(model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, EPISODES_PER_EPOCH, 
-                optimizer, nn.CrossEntropyLoss(), use_noise=False, distance_fn=cosine_similarity)
+# for it in range(NUM_ITER_AVG):
+#     # Train a model using cosine similarity
+#     if DATASET in ['omniglot', 'mnist']:
+#         model = MANN(dataset=DATASET, quantize=False, out_dim = OUTPUT_DIM).to(DEVICE)
+#     else:
+#         model = EnhancedMANN(dataset=DATASET, quantize=False, out_dim = OUTPUT_DIM).to(DEVICE)
+#     optimizer = optim.Adam(model.parameters(), lr=1e-3)
+#     train_model(model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, EPISODES_PER_EPOCH, 
+#                 optimizer, nn.CrossEntropyLoss(), use_noise=False, distance_fn=cosine_similarity)
     
 
-# Test with each distance metric
-for i, (test_name, test_fn) in enumerate(distance_fns):
-    print(f"Iteration {it+1}/{NUM_ITER_AVG}, Testing with {test_name}")
+#     # Test with each distance metric
+#     for i, (test_name, test_fn) in enumerate(distance_fns):
+#         print(f"Iteration {it+1}/{NUM_ITER_AVG}, Testing with {test_name}")
+        
+#         # 根據測試名稱決定是否量化
+#         if test_name == "Cosine (No Quant)":
+#             # 不進行量化的測試
+#             acc = test_model_without_quantization(model, test_data, N_WAY, K_SHOT, N_QUERY, 
+#                                                 TEST_EPISODES, test_fn)
+#         else:
+#             # 進行量化的測試
+#             acc = test_model_with_enforced_quantization(model, test_data, N_WAY, K_SHOT, N_QUERY, 
+#                                                       TEST_EPISODES, test_fn)
+        
+#         results[i, it] = acc
+
+# # Print results
+# # Calculate mean and standard deviation before printing results
+# mean_results = np.mean(results, axis=1)
+# std_results = np.std(results, axis=1)
+
+# # Print results
+# print("\nFinal Results (Trained with Cosine Similarity):")
+# for i, (metric_name, _) in enumerate(distance_fns):
+#     print(f"{metric_name}: {mean_results[i]:.2f}% ± {std_results[i]:.2f}%")
+
+# # 將結果存成CSV格式
+# import pandas as pd
+# result_dict = {
+#     'metric': [name for name, _ in distance_fns],
+#     'mean_accuracy': mean_results,
+#     'std_dev': std_results
+# }
+# # 為每次迭代創建單獨的列
+# for i in range(NUM_ITER_AVG):
+#     result_dict[f'iter_{i+1}'] = results[:, i]
+
+# result_df = pd.DataFrame(result_dict)
+# result_df.to_csv("distance_metric_comparison.csv", index=False)
+# print("Results saved to distance_metric_comparison.csv")
+
+# # Save results in NPZ format as before
+# # Save results in NPZ format as before
+# np.savez("distance_metric_comparison.npz", 
+#          mean=mean_results, 
+#          std=std_results,
+#          raw=results, 
+#          metrics=[name for name, _ in distance_fns])
+
+# # Create bar plot
+# plt.figure(figsize=(10, 6))
+# x = np.arange(len(distance_fns))
+# plt.bar(x, mean_results, yerr=std_results, capsize=8, width=0.6)
+# plt.xticks(x, [name for name, _ in distance_fns])
+# plt.ylabel("Accuracy (%)")
+# plt.title("Model Performance with Different Distance Metrics\n(Trained with Cosine Similarity)")
+# plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+# # 設置y軸範圍，只顯示80%以上的部分
+# plt.ylim(60, 90)
+
+# plt.tight_layout()
+# plt.savefig("distance_metric_comparison.png", dpi=300)
+# plt.show()
+
+# print("執行t-SNE分析以可視化不同距離度量下的嵌入向量關係...")
+# visualize_tsne_embeddings(model, test_data, N_WAY, K_SHOT, N_QUERY, distance_fns)
+
+# -------------------------------
+# 額外實驗：使用不同的距離度量訓練模型
+# -------------------------------
+
+print("\n正在進行額外實驗：使用不同的距離度量訓練模型...\n")
+
+# 定義訓練距離度量
+training_distances = [
+    ("Cosine", cosine_similarity),
+    ("L-1", l1_similarity_for_training),
+    ("L-inf", linf_similarity_for_training)
+]
+
+# 用於存儲所有結果的數組
+all_training_results = np.zeros((len(training_distances), len(distance_fns), NUM_ITER_AVG))
+
+# 存儲每種訓練距離最後一次迭代的模型，用於t-SNE比較
+trained_models = []
+model_names = []
+
+# 對每種訓練距離測試
+for train_idx, (train_name, train_fn) in enumerate(training_distances):
+    print(f"\n==== 使用 {train_name} 距離訓練模型 ====\n")
     
-    # 根據測試名稱決定是否量化
-    if test_name == "Cosine (No Quant)":
-        # 不進行量化的測試
-        acc = test_model_without_quantization(model, test_data, N_WAY, K_SHOT, N_QUERY, 
-                                            TEST_EPISODES, test_fn)
-    else:
-        # 進行量化的測試
-        acc = test_model_with_enforced_quantization(model, test_data, N_WAY, K_SHOT, N_QUERY, 
-                                                  TEST_EPISODES, test_fn)
+    # 針對每種訓練距離重複實驗多次
+    for it in range(NUM_ITER_AVG):
+        print(f"實驗 {it+1}/{NUM_ITER_AVG}")
+        
+        # 初始化模型
+        if DATASET in ['omniglot', 'mnist']:
+            model = MANN(dataset=DATASET, quantize=False, out_dim=OUTPUT_DIM).to(DEVICE)
+        else:
+            model = EnhancedMANN(dataset=DATASET, quantize=False, out_dim=OUTPUT_DIM).to(DEVICE)
+            
+        optimizer = optim.Adam(model.parameters(), lr=1e-3)
+        
+        # 使用指定的距離函數訓練模型
+        train_model(model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, EPISODES_PER_EPOCH,
+                  optimizer, nn.CrossEntropyLoss(), use_noise=False, distance_fn=train_fn)
+        
+        # 儲存最後一次迭代的模型
+        if it == NUM_ITER_AVG - 1:
+            trained_models.append(model)
+            model_names.append(f"Trained with {train_name}")
+        
+        # 使用不同的度量測試模型
+        for test_idx, (test_name, test_fn) in enumerate(distance_fns):
+            print(f"  測試 {test_name}")
+            
+            # 根據測試名稱決定是否量化
+            if test_name == "Cosine (No Quant)":
+                # 不進行量化的測試
+                acc = test_model_without_quantization(model, test_data, N_WAY, K_SHOT, N_QUERY,
+                                                    TEST_EPISODES, test_fn)
+            else:
+                # 進行量化的測試
+                acc = test_model_with_enforced_quantization(model, test_data, N_WAY, K_SHOT, N_QUERY,
+                                                          TEST_EPISODES, test_fn)
+            
+            all_training_results[train_idx, test_idx, it] = acc
     
-    results[i, it] = acc
+    # 計算平均值和標準差
+    means = np.mean(all_training_results[train_idx], axis=1)
+    stds = np.std(all_training_results[train_idx], axis=1)
+    
+    # 輸出當前訓練距離度量的結果
+    print(f"\n{train_name} 訓練結果:")
+    for i, (metric_name, _) in enumerate(distance_fns):
+        print(f"{metric_name}: {means[i]:.2f}% ± {stds[i]:.2f}%")
 
-# Print results
-# Calculate mean and standard deviation before printing results
-mean_results = np.mean(results, axis=1)
-std_results = np.std(results, axis=1)
+# 保存實驗結果
+np.savez("different_training_metrics_results.npz",
+         training_metrics=[name for name, _ in training_distances],
+         test_metrics=[name for name, _ in distance_fns],
+         results=all_training_results)
 
-# Print results
-print("\nFinal Results (Trained with Cosine Similarity):")
-for i, (metric_name, _) in enumerate(distance_fns):
-    print(f"{metric_name}: {mean_results[i]:.2f}% ± {std_results[i]:.2f}%")
+# 創建比較圖表
+# ... [保留原始的條形圖代碼]
 
-# 將結果存成CSV格式
-import pandas as pd
-result_dict = {
-    'metric': [name for name, _ in distance_fns],
-    'mean_accuracy': mean_results,
-    'std_dev': std_results
-}
-# 為每次迭代創建單獨的列
-for i in range(NUM_ITER_AVG):
-    result_dict[f'iter_{i+1}'] = results[:, i]
+# 生成t-SNE可視化比較
+print("\n正在生成t-SNE嵌入空間比較...")
+visualize_tsne_for_different_training_metrics(
+    trained_models, 
+    model_names, 
+    test_data, 
+    N_WAY, 
+    K_SHOT, 
+    N_QUERY, 
+    distance_fns
+)
 
-result_df = pd.DataFrame(result_dict)
-result_df.to_csv("distance_metric_comparison.csv", index=False)
-print("Results saved to distance_metric_comparison.csv")
-
-# Save results in NPZ format as before
-np.savez("distance_metric_comparison.npz", 
-         mean=mean_results, 
-         std=std_results,
-         raw=results, 
-         metrics=[name for name, _ in distance_fns])
-
-# Create bar plot
-plt.figure(figsize=(10, 6))
-x = np.arange(len(distance_fns))
-plt.bar(x, mean_results, yerr=std_results, capsize=8, width=0.6)
-plt.xticks(x, [name for name, _ in distance_fns])
-plt.ylabel("Accuracy (%)")
-plt.title("Model Performance with Different Distance Metrics\n(Trained with Cosine Similarity)")
-plt.grid(axis='y', linestyle='--', alpha=0.7)
-
-# 設置y軸範圍，只顯示80%以上的部分
-plt.ylim(80, 100)
-
-plt.tight_layout()
-plt.savefig("distance_metric_comparison.png", dpi=300)
-plt.show()
-
-print("執行t-SNE分析以可視化不同距離度量下的嵌入向量關係...")
-visualize_tsne_embeddings(model, test_data, N_WAY, K_SHOT, N_QUERY, distance_fns)
+print("所有實驗、比較和可視化已完成！")
