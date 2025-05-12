@@ -18,7 +18,7 @@ import matplotlib.colors as mcolors
 # Parameters
 # -------------------------------
 # Dataset selection 'omniglot', 'cifar-10', 'mnist'
-DATASET = 'omniglot'
+DATASET = 'mnist'
 N_WAY = 5
 K_SHOT = 1
 N_QUERY = 5
@@ -957,86 +957,86 @@ distance_fns = [
     ("L-inf", linf_distance)
 ]
 
-# results = np.zeros((len(distance_fns), NUM_ITER_AVG))
+results = np.zeros((len(distance_fns), NUM_ITER_AVG))
 
-# for it in range(NUM_ITER_AVG):
-#     # Train a model using cosine similarity
-#     if DATASET in ['omniglot', 'mnist']:
-#         model = MANN(dataset=DATASET, quantize=False, out_dim = OUTPUT_DIM).to(DEVICE)
-#     else:
-#         model = EnhancedMANN(dataset=DATASET, quantize=False, out_dim = OUTPUT_DIM).to(DEVICE)
-#     optimizer = optim.Adam(model.parameters(), lr=1e-3)
-#     train_model(model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, EPISODES_PER_EPOCH, 
-#                 optimizer, nn.CrossEntropyLoss(), use_noise=False, distance_fn=cosine_similarity)
+for it in range(NUM_ITER_AVG):
+    # Train a model using cosine similarity
+    if DATASET in ['omniglot', 'mnist']:
+        model = MANN(dataset=DATASET, quantize=False, out_dim = OUTPUT_DIM).to(DEVICE)
+    else:
+        model = EnhancedMANN(dataset=DATASET, quantize=False, out_dim = OUTPUT_DIM).to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    train_model(model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, EPISODES_PER_EPOCH, 
+                optimizer, nn.CrossEntropyLoss(), use_noise=False, distance_fn=cosine_similarity)
     
 
-#     # Test with each distance metric
-#     for i, (test_name, test_fn) in enumerate(distance_fns):
-#         print(f"Iteration {it+1}/{NUM_ITER_AVG}, Testing with {test_name}")
+    # Test with each distance metric
+    for i, (test_name, test_fn) in enumerate(distance_fns):
+        print(f"Iteration {it+1}/{NUM_ITER_AVG}, Testing with {test_name}")
         
-#         # 根據測試名稱決定是否量化
-#         if test_name == "Cosine (No Quant)":
-#             # 不進行量化的測試
-#             acc = test_model_without_quantization(model, test_data, N_WAY, K_SHOT, N_QUERY, 
-#                                                 TEST_EPISODES, test_fn)
-#         else:
-#             # 進行量化的測試
-#             acc = test_model_with_enforced_quantization(model, test_data, N_WAY, K_SHOT, N_QUERY, 
-#                                                       TEST_EPISODES, test_fn)
+        # 根據測試名稱決定是否量化
+        if test_name == "Cosine (No Quant)":
+            # 不進行量化的測試
+            acc = test_model_without_quantization(model, test_data, N_WAY, K_SHOT, N_QUERY, 
+                                                TEST_EPISODES, test_fn)
+        else:
+            # 進行量化的測試
+            acc = test_model_with_enforced_quantization(model, test_data, N_WAY, K_SHOT, N_QUERY, 
+                                                      TEST_EPISODES, test_fn)
         
-#         results[i, it] = acc
+        results[i, it] = acc
 
-# # Print results
-# # Calculate mean and standard deviation before printing results
-# mean_results = np.mean(results, axis=1)
-# std_results = np.std(results, axis=1)
+# Print results
+# Calculate mean and standard deviation before printing results
+mean_results = np.mean(results, axis=1)
+std_results = np.std(results, axis=1)
 
-# # Print results
-# print("\nFinal Results (Trained with Cosine Similarity):")
-# for i, (metric_name, _) in enumerate(distance_fns):
-#     print(f"{metric_name}: {mean_results[i]:.2f}% ± {std_results[i]:.2f}%")
+# Print results
+print("\nFinal Results (Trained with Cosine Similarity):")
+for i, (metric_name, _) in enumerate(distance_fns):
+    print(f"{metric_name}: {mean_results[i]:.2f}% ± {std_results[i]:.2f}%")
 
-# # 將結果存成CSV格式
-# import pandas as pd
-# result_dict = {
-#     'metric': [name for name, _ in distance_fns],
-#     'mean_accuracy': mean_results,
-#     'std_dev': std_results
-# }
-# # 為每次迭代創建單獨的列
-# for i in range(NUM_ITER_AVG):
-#     result_dict[f'iter_{i+1}'] = results[:, i]
+# 將結果存成CSV格式
+import pandas as pd
+result_dict = {
+    'metric': [name for name, _ in distance_fns],
+    'mean_accuracy': mean_results,
+    'std_dev': std_results
+}
+# 為每次迭代創建單獨的列
+for i in range(NUM_ITER_AVG):
+    result_dict[f'iter_{i+1}'] = results[:, i]
 
-# result_df = pd.DataFrame(result_dict)
-# result_df.to_csv("distance_metric_comparison.csv", index=False)
-# print("Results saved to distance_metric_comparison.csv")
+result_df = pd.DataFrame(result_dict)
+result_df.to_csv("distance_metric_comparison.csv", index=False)
+print("Results saved to distance_metric_comparison.csv")
 
-# # Save results in NPZ format as before
-# # Save results in NPZ format as before
-# np.savez("distance_metric_comparison.npz", 
-#          mean=mean_results, 
-#          std=std_results,
-#          raw=results, 
-#          metrics=[name for name, _ in distance_fns])
+# Save results in NPZ format as before
+# Save results in NPZ format as before
+np.savez("distance_metric_comparison.npz", 
+         mean=mean_results, 
+         std=std_results,
+         raw=results, 
+         metrics=[name for name, _ in distance_fns])
 
-# # Create bar plot
-# plt.figure(figsize=(10, 6))
-# x = np.arange(len(distance_fns))
-# plt.bar(x, mean_results, yerr=std_results, capsize=8, width=0.6)
-# plt.xticks(x, [name for name, _ in distance_fns])
-# plt.ylabel("Accuracy (%)")
-# plt.title("Model Performance with Different Distance Metrics\n(Trained with Cosine Similarity)")
-# plt.grid(axis='y', linestyle='--', alpha=0.7)
+# Create bar plot
+plt.figure(figsize=(10, 6))
+x = np.arange(len(distance_fns))
+plt.bar(x, mean_results, yerr=std_results, capsize=8, width=0.6)
+plt.xticks(x, [name for name, _ in distance_fns])
+plt.ylabel("Accuracy (%)")
+plt.title("Model Performance with Different Distance Metrics\n(Trained with Cosine Similarity)")
+plt.grid(axis='y', linestyle='--', alpha=0.7)
 
-# # 設置y軸範圍，只顯示80%以上的部分
-# plt.ylim(60, 90)
+# 設置y軸範圍，只顯示80%以上的部分
+plt.ylim(90, 100)
 
-# plt.tight_layout()
-# plt.savefig("distance_metric_comparison.png", dpi=300)
-# plt.show()
+plt.tight_layout()
+plt.savefig("distance_metric_comparison.png", dpi=300)
+plt.show()
 
-# print("執行t-SNE分析以可視化不同距離度量下的嵌入向量關係...")
-# visualize_tsne_embeddings(model, test_data, N_WAY, K_SHOT, N_QUERY, distance_fns)
+print("執行t-SNE分析以可視化不同距離度量下的嵌入向量關係...")
+visualize_tsne_embeddings(model, test_data, N_WAY, K_SHOT, N_QUERY, distance_fns)
 
 # -------------------------------
 # 額外實驗：使用不同的距離度量訓練模型
@@ -1109,7 +1109,7 @@ for train_idx, (train_name, train_fn) in enumerate(training_distances):
         print(f"{metric_name}: {means[i]:.2f}% ± {stds[i]:.2f}%")
 
 # 保存實驗結果
-np.savez("different_training_metrics_results.npz",
+np.savez(f"{DATASET}_different_training_metrics_results.npz",
          training_metrics=[name for name, _ in training_distances],
          test_metrics=[name for name, _ in distance_fns],
          results=all_training_results)
@@ -1128,5 +1128,40 @@ visualize_tsne_for_different_training_metrics(
     N_QUERY, 
     distance_fns
 )
+
+# 计算每个训练-测试度量组合的平均值和标准差
+mean_results = np.mean(all_training_results, axis=2)  # 平均值
+std_results = np.std(all_training_results, axis=2)    # 标准差
+
+# 设置图形大小
+plt.figure(figsize=(12, 8))
+
+# 设置条形图的位置和宽度
+bar_width = 0.25
+x = np.arange(len(distance_fns))
+
+# 创建不同颜色的条形图，每个条代表一种训练度量
+colors = ['#1f77b4', '#ff7f0e', '#2ca02c']  # 蓝、橙、绿
+for i, (train_name, _) in enumerate(training_distances):
+    plt.bar(x + i*bar_width - bar_width, mean_results[i, :], 
+            yerr=std_results[i, :], capsize=5, width=bar_width, 
+            color=colors[i], label=f"Trained with {train_name}")
+
+# 添加图例、标题和标签
+plt.xlabel('Testing Distance Metric', fontsize=12)
+plt.ylabel('Accuracy (%)', fontsize=12)
+plt.title('Model Performance with Different Training and Testing Distance Metrics', fontsize=14)
+plt.xticks(x, [name for name, _ in distance_fns])
+plt.legend(loc='lower right')
+
+# 设置网格线
+plt.grid(axis='y', linestyle='--', alpha=0.7)
+
+# 设置y轴范围，只显示90%以上的准确率部分
+plt.ylim(90, 100)
+
+plt.tight_layout()
+plt.savefig(f"{DATASET}_testing_metrics_comparison.png", dpi=300)
+plt.show()
 
 print("所有實驗、比較和可視化已完成！")
