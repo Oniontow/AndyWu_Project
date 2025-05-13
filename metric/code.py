@@ -18,7 +18,7 @@ import matplotlib.colors as mcolors
 # Parameters
 # -------------------------------
 # Dataset selection 'omniglot', 'cifar-10', 'mnist'
-DATASET = 'mnist'
+DATASET = 'omniglot'
 N_WAY = 5
 K_SHOT = 1
 N_QUERY = 5
@@ -285,32 +285,6 @@ def apply_consistent_quantization(support_emb, query_emb):
     
     return support_emb_q, query_emb_q
 
-def hybrid_distance(a, b, alpha=0.7, beta=0.3):
-    """
-    Hybrid distance metric combining cosine similarity with other metrics
-    
-    Args:
-        a, b: Embedding vectors
-        alpha: Weight for cosine similarity
-        beta: Weight for L1 distance (remaining weight is for Hamming)
-    """
-    cosine_scores = cosine_similarity(a, b)
-    l1_scores = l1_distance(a, b)
-    
-    # Normalize L1 scores
-    l1_min = torch.min(l1_scores)
-    l1_max = torch.max(l1_scores)
-    l1_norm = (l1_scores - l1_min) / (l1_max - l1_min + 1e-8)
-    
-    # Get enhanced hamming distance
-    hamming_scores = enhanced_hamming_distance(a, b)
-    hamming_min = torch.min(hamming_scores)
-    hamming_max = torch.max(hamming_scores)
-    hamming_norm = (hamming_scores - hamming_min) / (hamming_max - hamming_min + 1e-8)
-    
-    # Combine all scores
-    return alpha * cosine_scores + beta * l1_norm + (1-alpha-beta) * hamming_norm
-
 def hamming_distance(a, b):
     """
     計算兩組嵌入向量間的位元層級 Hamming 距離
@@ -366,37 +340,41 @@ def l1_similarity_for_training(a, b):
     
     return similarities
 
-def linf_similarity_for_training(a, b, iterations=300, temperature=10.0):
+def linf_similarity_for_training(a, b):
     """
-    改進的L-infinity相似度函數 - 使用多層softmax加強對最大差異的敏感度
-    
-    Args:
-        a, b: 嵌入向量
-        iterations: softmax疊加的次數
-        temperature: softmax溫度參數，控制軟化程度
+    L-infinity similarity for training: use softmax(100 * abs diff) as attention over dimensions,
+    then convert to similarity score.
     """
-    # 計算絕對差異
     abs_diff = torch.abs(a.unsqueeze(1) - b.unsqueeze(0))  # [query_size, support_size, dim]
-    
-    # 對每個維度進行多次softmax處理，加強對最大差異的敏感度
-    # 先將差異矩陣轉置，使維度在前面，便於對每對向量的所有維度應用softmax
-    # [query_size, support_size, dim] -> [query_size, support_size, dim]
-    weights = abs_diff.clone()
-    
-    # 多次應用softmax，每次都會進一步強化最大值
-    for _ in range(iterations):
-        # 在維度方向應用softmax
-        weights = F.softmax(weights * temperature, dim=2)
-    
-    # 加權平均，注重最大差異的維度
-    # 使用weights作為注意力，強調最大差異的維度
+    weights = torch.softmax(100.0 * abs_diff, dim=2)
     weighted_diff = (abs_diff * weights).sum(dim=2)
-    
-    # 歸一化為相似度分數
     max_value = torch.max(weighted_diff) + 1e-8
     similarities = 1.0 - weighted_diff / max_value
-    
     return similarities
+
+def lsh_similarity(a, b, num_bits=32*8, random_seed=42):
+    """
+    LSH similarity: project embeddings onto random hyperplanes, 
+    use sign as hash, then compute Hamming similarity.
+    """
+    # a: [N, D], b: [M, D]
+    torch.manual_seed(random_seed)
+    device = a.device
+    D = a.size(1)
+    # 產生隨機超平面
+    hyperplanes = torch.randn(D, num_bits, device=device)
+    # 投影並取sign
+    a_proj = (a @ hyperplanes) > 0  # [N, num_bits], bool
+    b_proj = (b @ hyperplanes) > 0  # [M, num_bits], bool
+    # 計算 Hamming similarity
+    # 先轉成int
+    a_proj = a_proj.int()
+    b_proj = b_proj.int()
+    # [N, 1, num_bits] vs [1, M, num_bits]
+    matches = (a_proj.unsqueeze(1) == b_proj.unsqueeze(0)).sum(dim=2)  # [N, M]
+    # 相似度 = 相同bit數 / num_bits
+    sim = matches.float() / num_bits
+    return sim
 
 # -------------------------------
 # Data Utilities
@@ -954,7 +932,8 @@ distance_fns = [
     ("Cosine (No Quant)", cosine_similarity),  
     ("Cosine", cosine_similarity),
     ("L-1", l1_distance),
-    ("L-inf", linf_distance)
+    ("L-inf", linf_distance),
+    ("LSH", lsh_similarity)  # 新增LSH
 ]
 
 results = np.zeros((len(distance_fns), NUM_ITER_AVG))
@@ -1029,7 +1008,7 @@ plt.title("Model Performance with Different Distance Metrics\n(Trained with Cosi
 plt.grid(axis='y', linestyle='--', alpha=0.7)
 
 # 設置y軸範圍，只顯示80%以上的部分
-plt.ylim(90, 100)
+plt.ylim(75, 85)
 
 plt.tight_layout()
 plt.savefig("distance_metric_comparison.png", dpi=300)
@@ -1158,10 +1137,77 @@ plt.legend(loc='lower right')
 plt.grid(axis='y', linestyle='--', alpha=0.7)
 
 # 设置y轴范围，只显示90%以上的准确率部分
-plt.ylim(90, 100)
+plt.ylim(65, 90)
 
 plt.tight_layout()
 plt.savefig(f"{DATASET}_testing_metrics_comparison.png", dpi=300)
 plt.show()
 
+# -------------------------------
+# LSH bit 數量對 performance 的分析
+# -------------------------------
+
+# 重新訓練一個用 cosine similarity 的模型，專門給 LSH bit 數量分析用
+print("\n重新訓練一個模型（cosine similarity）供 LSH bit 數量分析...")
+if DATASET in ['omniglot', 'mnist']:
+    lsh_model = MANN(dataset=DATASET, quantize=False, out_dim=OUTPUT_DIM).to(DEVICE)
+else:
+    lsh_model = EnhancedMANN(dataset=DATASET, quantize=False, out_dim=OUTPUT_DIM).to(DEVICE)
+lsh_optimizer = optim.Adam(lsh_model.parameters(), lr=1e-3)
+train_model(
+    lsh_model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, EPISODES_PER_EPOCH,
+    lsh_optimizer, nn.CrossEntropyLoss(), use_noise=False, distance_fn=cosine_similarity
+)
+
+print("\n分析不同 LSH bit 數量對 cosine similarity 訓練模型的 performance...")
+
+lsh_bits_list = [16, 24, 32, 48, 64, 128, 256, 400, 512, 768, 1024, 1532, 2048, 3000, 4096, 8192]
+lsh_accs_all = np.zeros((len(lsh_bits_list), NUM_ITER_AVG))
+
+for idx, num_bits in enumerate(lsh_bits_list):
+    print(f"\nLSH bits = {num_bits}，進行 {NUM_ITER_AVG} 次訓練與測試...")
+    for it in range(NUM_ITER_AVG):
+        # 重新訓練模型
+        if DATASET in ['omniglot', 'mnist']:
+            lsh_model = MANN(dataset=DATASET, quantize=False, out_dim=OUTPUT_DIM).to(DEVICE)
+        else:
+            lsh_model = EnhancedMANN(dataset=DATASET, quantize=False, out_dim=OUTPUT_DIM).to(DEVICE)
+        lsh_optimizer = optim.Adam(lsh_model.parameters(), lr=1e-3)
+        train_model(
+            lsh_model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, EPISODES_PER_EPOCH,
+            lsh_optimizer, nn.CrossEntropyLoss(), use_noise=False, distance_fn=cosine_similarity
+        )
+        # 測試
+        def lsh_fn(a, b, num_bits=num_bits):
+            return lsh_similarity(a, b, num_bits=num_bits)
+        acc = test_model_with_enforced_quantization(
+            lsh_model, test_data, N_WAY, K_SHOT, N_QUERY, TEST_EPISODES, lsh_fn
+        )
+        lsh_accs_all[idx, it] = acc
+        print(f"  第 {it+1} 次：{acc:.2f}%")
+
+# 計算平均與標準差
+lsh_accs_mean = np.mean(lsh_accs_all, axis=1)
+lsh_accs_std = np.std(lsh_accs_all, axis=1)
+
+# 畫圖
+plt.figure(figsize=(8, 5))
+plt.errorbar(lsh_bits_list, lsh_accs_mean, yerr=lsh_accs_std, marker='o', capsize=5)
+plt.xscale("log")
+plt.xlabel("Number of LSH bits")
+plt.ylabel("Accuracy (%)")
+plt.title("Effect of LSH Bit Number on Model Performance\n(Trained & Tested 10x Each)")
+plt.grid(True, linestyle='--', alpha=0.7)
+plt.tight_layout()
+plt.savefig(f"{DATASET}_lsh_bits_analysis.png", dpi=300)
+plt.show()
+
+# 存成 csv
+import pandas as pd
+pd.DataFrame({
+    "lsh_bits": lsh_bits_list,
+    "mean_accuracy": lsh_accs_mean,
+    "std": lsh_accs_std
+}).to_csv(f"{DATASET}_lsh_bits_analysis.csv", index=False)
+print("LSH bit 數量分析已完成，結果已儲存。")
 print("所有實驗、比較和可視化已完成！")
