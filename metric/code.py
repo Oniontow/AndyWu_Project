@@ -12,12 +12,11 @@ from bayesian_torch.models.dnn_to_bnn import get_kl_loss
 from torchvision import datasets
 from sklearn.manifold import TSNE
 import matplotlib.colors as mcolors
-
+import pandas as pd
 
 # -------------------------------
 # Parameters
 # -------------------------------
-# Dataset selection 'omniglot', 'cifar-10', 'mnist'
 DATASET = 'omniglot'
 N_WAY = 5
 K_SHOT = 1
@@ -261,11 +260,6 @@ class EnhancedBayesianMANN(nn.Module):
 def bayesian_loss(model, criterion, outputs, targets, kl_weight=1.0):
     return criterion(outputs, targets) + kl_weight * get_kl_loss(model)
 
-def cosine_similarity(a, b):
-    a_norm = F.normalize(a, p=2, dim=1)
-    b_norm = F.normalize(b, p=2, dim=1)
-    return torch.mm(a_norm, b_norm.t())
-
 def apply_consistent_quantization(support_emb, query_emb):
     """
     Apply consistent quantization to both support and query embeddings
@@ -285,67 +279,54 @@ def apply_consistent_quantization(support_emb, query_emb):
     
     return support_emb_q, query_emb_q
 
+
+
+# -------------------------------
+# Distance Functions
+# -------------------------------
+def cosine_similarity(a, b):
+    a_norm = F.normalize(a, p=2, dim=1)
+    b_norm = F.normalize(b, p=2, dim=1)
+    return torch.mm(a_norm, b_norm.t())
+
+def apply_consistent_quantization(support_emb, query_emb):
+    all_embs = torch.cat([support_emb, query_emb], dim=0)
+    abs_max = torch.max(torch.abs(all_embs)).item()
+    scale = 127.0 / (abs_max + 1e-8)
+    quantized_support, _ = quantize_to_int8(support_emb, scale)
+    quantized_query, _ = quantize_to_int8(query_emb, scale)
+    support_emb_q = dequantize_from_int8(quantized_support, scale)
+    query_emb_q = dequantize_from_int8(quantized_query, scale)
+    return support_emb_q, query_emb_q
+
 def hamming_distance(a, b):
     """
-    計算兩組嵌入向量間的位元層級 Hamming 距離
-    對於嵌入向量中的每個元素，將其視為 8 位元的整數，並計算對應位置上位元不同的數量
+    Hamming distance based on sign: 先將 embedding 轉成 sign（>0 為 1，<=0 為 0），
+    再計算 sign 不同的比例，最後回傳「相似度」(1-距離)，shape [N, M]。
     """
-    # 確保張量已被量化為整數範圍
-    a_int = a.round().long() & 0xFF  # 取最低8位
-    b_int = b.round().long() & 0xFF
-    
-    # 擴展維度以進行廣播
-    a_expanded = a_int.unsqueeze(1)  # shape: [query_size, 1, dim]
-    b_expanded = b_int.unsqueeze(0)  # shape: [1, support_size, dim]
-    
-    # 計算位元層級的 Hamming 距離
-    bit_diff = torch.zeros(a_expanded.size(0), b_expanded.size(1), a_expanded.size(2), dtype=torch.long).to(a.device)
-    
-    # 對每一位進行 XOR 操作，數 1 的個數
-    for i in range(8):
-        bit_mask = 1 << i
-        bit_diff += ((a_expanded & bit_mask) != (b_expanded & bit_mask)).long()
-    
-    # 對所有維度加總距離
-    dist = bit_diff.sum(dim=2)
-    
-    # 返回負距離，使得值越大表示越相似
-    return -dist
+    a_q, b_q = apply_consistent_quantization(a, b)
+    a_sign = (a_q > 0).to(torch.uint8)
+    b_sign = (b_q > 0).to(torch.uint8)
+    diff = (a_sign.unsqueeze(1) != b_sign.unsqueeze(0)).sum(dim=2)
+    sim = 1.0 - diff.float() / a_sign.size(1)
+    return sim
 
 def linf_distance(a, b):
-    # L-infinity距離越小越相似，這裡回傳負的距離作為分數
     dist = torch.max(torch.abs(a.unsqueeze(1) - b.unsqueeze(0)), dim=2)[0]
     return -dist
 
 def l1_distance(a, b):
-    """
-    L1 distance (Manhattan distance) - sum of absolute differences
-    Return negative distance so that higher values mean more similar (consistent with cosine)
-    """
     dist = torch.sum(torch.abs(a.unsqueeze(1) - b.unsqueeze(0)), dim=2)
     return -dist
 
 def l1_similarity_for_training(a, b):
-    """
-    可訓練的L1相似度函數 - 將L1距離轉換為相似度分數
-    這個函數會返回相似度而非距離，以便用於訓練
-    """
-    # 計算L1距離
     distances = torch.sum(torch.abs(a.unsqueeze(1) - b.unsqueeze(0)), dim=2)
-    
-    # 將距離歸一化為相似度分數 (0-1範圍)，方便訓練
-    # 使用批次內的最大距離進行歸一化
     max_dist = torch.max(distances) + 1e-8
     similarities = 1.0 - distances / max_dist
-    
     return similarities
 
 def linf_similarity_for_training(a, b):
-    """
-    L-infinity similarity for training: use softmax(100 * abs diff) as attention over dimensions,
-    then convert to similarity score.
-    """
-    abs_diff = torch.abs(a.unsqueeze(1) - b.unsqueeze(0))  # [query_size, support_size, dim]
+    abs_diff = torch.abs(a.unsqueeze(1) - b.unsqueeze(0))
     weights = torch.softmax(100.0 * abs_diff, dim=2)
     weighted_diff = (abs_diff * weights).sum(dim=2)
     max_value = torch.max(weighted_diff) + 1e-8
@@ -353,26 +334,15 @@ def linf_similarity_for_training(a, b):
     return similarities
 
 def lsh_similarity(a, b, num_bits=32*8, random_seed=42):
-    """
-    LSH similarity: project embeddings onto random hyperplanes, 
-    use sign as hash, then compute Hamming similarity.
-    """
-    # a: [N, D], b: [M, D]
     torch.manual_seed(random_seed)
     device = a.device
     D = a.size(1)
-    # 產生隨機超平面
     hyperplanes = torch.randn(D, num_bits, device=device)
-    # 投影並取sign
-    a_proj = (a @ hyperplanes) > 0  # [N, num_bits], bool
-    b_proj = (b @ hyperplanes) > 0  # [M, num_bits], bool
-    # 計算 Hamming similarity
-    # 先轉成int
+    a_proj = (a @ hyperplanes) > 0
+    b_proj = (b @ hyperplanes) > 0
     a_proj = a_proj.int()
     b_proj = b_proj.int()
-    # [N, 1, num_bits] vs [1, M, num_bits]
-    matches = (a_proj.unsqueeze(1) == b_proj.unsqueeze(0)).sum(dim=2)  # [N, M]
-    # 相似度 = 相同bit數 / num_bits
+    matches = (a_proj.unsqueeze(1) == b_proj.unsqueeze(0)).sum(dim=2)
     sim = matches.float() / num_bits
     return sim
 
@@ -896,7 +866,7 @@ def test_model_without_quantization(model, data_by_class, n_way, k_shot, n_query
     acc = total_correct / total_num * 100.0
     return acc
 
-# -------------------------------
+## -------------------------------
 # Dataset Preparation
 # -------------------------------
 if DATASET == 'omniglot':
@@ -925,289 +895,220 @@ elif DATASET == 'mnist':
 train_data = organize_by_class(train_dataset)
 test_data = organize_by_class(test_dataset)
 
-# -------------------------------
-# Main Experiment Loop
-# -------------------------------
 distance_fns = [
-    ("Cosine (No Quant)", cosine_similarity),  
     ("Cosine", cosine_similarity),
     ("L-1", l1_distance),
     ("L-inf", linf_distance),
-    ("LSH", lsh_similarity)  # 新增LSH
 ]
 
-results = np.zeros((len(distance_fns), NUM_ITER_AVG))
-
-for it in range(NUM_ITER_AVG):
-    # Train a model using cosine similarity
-    if DATASET in ['omniglot', 'mnist']:
-        model = MANN(dataset=DATASET, quantize=False, out_dim = OUTPUT_DIM).to(DEVICE)
-    else:
-        model = EnhancedMANN(dataset=DATASET, quantize=False, out_dim = OUTPUT_DIM).to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    train_model(model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, EPISODES_PER_EPOCH, 
-                optimizer, nn.CrossEntropyLoss(), use_noise=False, distance_fn=cosine_similarity)
-    
-
-    # Test with each distance metric
-    for i, (test_name, test_fn) in enumerate(distance_fns):
-        print(f"Iteration {it+1}/{NUM_ITER_AVG}, Testing with {test_name}")
-        
-        # 根據測試名稱決定是否量化
-        if test_name == "Cosine (No Quant)":
-            # 不進行量化的測試
-            acc = test_model_without_quantization(model, test_data, N_WAY, K_SHOT, N_QUERY, 
-                                                TEST_EPISODES, test_fn)
-        else:
-            # 進行量化的測試
-            acc = test_model_with_enforced_quantization(model, test_data, N_WAY, K_SHOT, N_QUERY, 
-                                                      TEST_EPISODES, test_fn)
-        
-        results[i, it] = acc
-
-# Print results
-# Calculate mean and standard deviation before printing results
-mean_results = np.mean(results, axis=1)
-std_results = np.std(results, axis=1)
-
-# Print results
-print("\nFinal Results (Trained with Cosine Similarity):")
-for i, (metric_name, _) in enumerate(distance_fns):
-    print(f"{metric_name}: {mean_results[i]:.2f}% ± {std_results[i]:.2f}%")
-
-# 將結果存成CSV格式
-import pandas as pd
-result_dict = {
-    'metric': [name for name, _ in distance_fns],
-    'mean_accuracy': mean_results,
-    'std_dev': std_results
-}
-# 為每次迭代創建單獨的列
-for i in range(NUM_ITER_AVG):
-    result_dict[f'iter_{i+1}'] = results[:, i]
-
-result_df = pd.DataFrame(result_dict)
-result_df.to_csv("distance_metric_comparison.csv", index=False)
-print("Results saved to distance_metric_comparison.csv")
-
-# Save results in NPZ format as before
-# Save results in NPZ format as before
-np.savez("distance_metric_comparison.npz", 
-         mean=mean_results, 
-         std=std_results,
-         raw=results, 
-         metrics=[name for name, _ in distance_fns])
-
-# Create bar plot
-plt.figure(figsize=(10, 6))
-x = np.arange(len(distance_fns))
-plt.bar(x, mean_results, yerr=std_results, capsize=8, width=0.6)
-plt.xticks(x, [name for name, _ in distance_fns])
-plt.ylabel("Accuracy (%)")
-plt.title("Model Performance with Different Distance Metrics\n(Trained with Cosine Similarity)")
-plt.grid(axis='y', linestyle='--', alpha=0.7)
-
-# 設置y軸範圍，只顯示80%以上的部分
-plt.ylim(75, 85)
-
-plt.tight_layout()
-plt.savefig("distance_metric_comparison.png", dpi=300)
-plt.show()
-
-print("執行t-SNE分析以可視化不同距離度量下的嵌入向量關係...")
-visualize_tsne_embeddings(model, test_data, N_WAY, K_SHOT, N_QUERY, distance_fns)
-
 # -------------------------------
-# 額外實驗：使用不同的距離度量訓練模型
+# 實驗 function 區塊
 # -------------------------------
-
-print("\n正在進行額外實驗：使用不同的距離度量訓練模型...\n")
-
-# 定義訓練距離度量
-training_distances = [
-    ("Cosine", cosine_similarity),
-    ("L-1", l1_similarity_for_training),
-    ("L-inf", linf_similarity_for_training)
-]
-
-# 用於存儲所有結果的數組
-all_training_results = np.zeros((len(training_distances), len(distance_fns), NUM_ITER_AVG))
-
-# 存儲每種訓練距離最後一次迭代的模型，用於t-SNE比較
-trained_models = []
-model_names = []
-
-# 對每種訓練距離測試
-for train_idx, (train_name, train_fn) in enumerate(training_distances):
-    print(f"\n==== 使用 {train_name} 距離訓練模型 ====\n")
-    
-    # 針對每種訓練距離重複實驗多次
+def experiment_main_distance_metrics():
+    results = np.zeros((len(distance_fns), NUM_ITER_AVG))
     for it in range(NUM_ITER_AVG):
-        print(f"實驗 {it+1}/{NUM_ITER_AVG}")
-        
-        # 初始化模型
         if DATASET in ['omniglot', 'mnist']:
             model = MANN(dataset=DATASET, quantize=False, out_dim=OUTPUT_DIM).to(DEVICE)
         else:
             model = EnhancedMANN(dataset=DATASET, quantize=False, out_dim=OUTPUT_DIM).to(DEVICE)
-            
         optimizer = optim.Adam(model.parameters(), lr=1e-3)
-        
-        # 使用指定的距離函數訓練模型
-        train_model(model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, EPISODES_PER_EPOCH,
-                  optimizer, nn.CrossEntropyLoss(), use_noise=False, distance_fn=train_fn)
-        
-        # 儲存最後一次迭代的模型
-        if it == NUM_ITER_AVG - 1:
-            trained_models.append(model)
-            model_names.append(f"Trained with {train_name}")
-        
-        # 使用不同的度量測試模型
-        for test_idx, (test_name, test_fn) in enumerate(distance_fns):
-            print(f"  測試 {test_name}")
-            
-            # 根據測試名稱決定是否量化
-            if test_name == "Cosine (No Quant)":
-                # 不進行量化的測試
-                acc = test_model_without_quantization(model, test_data, N_WAY, K_SHOT, N_QUERY,
-                                                    TEST_EPISODES, test_fn)
-            else:
-                # 進行量化的測試
-                acc = test_model_with_enforced_quantization(model, test_data, N_WAY, K_SHOT, N_QUERY,
-                                                          TEST_EPISODES, test_fn)
-            
-            all_training_results[train_idx, test_idx, it] = acc
-    
-    # 計算平均值和標準差
-    means = np.mean(all_training_results[train_idx], axis=1)
-    stds = np.std(all_training_results[train_idx], axis=1)
-    
-    # 輸出當前訓練距離度量的結果
-    print(f"\n{train_name} 訓練結果:")
+        train_model(model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, EPISODES_PER_EPOCH, 
+                    optimizer, nn.CrossEntropyLoss(), use_noise=False, distance_fn=cosine_similarity)
+        for i, (test_name, test_fn) in enumerate(distance_fns):
+            print(f"Iteration {it+1}/{NUM_ITER_AVG}, Testing with {test_name}")
+            acc = test_model_with_enforced_quantization(model, test_data, N_WAY, K_SHOT, N_QUERY, TEST_EPISODES, test_fn)
+            results[i, it] = acc
+
+    mean_results = np.mean(results, axis=1)
+    std_results = np.std(results, axis=1)
+    print("\nFinal Results (Trained with Cosine Similarity):")
     for i, (metric_name, _) in enumerate(distance_fns):
-        print(f"{metric_name}: {means[i]:.2f}% ± {stds[i]:.2f}%")
+        print(f"{metric_name}: {mean_results[i]:.2f}% ± {std_results[i]:.2f}%")
+    result_dict = {
+        'metric': [name for name, _ in distance_fns],
+        'mean_accuracy': mean_results,
+        'std_dev': std_results
+    }
+    for i in range(NUM_ITER_AVG):
+        result_dict[f'iter_{i+1}'] = results[:, i]
+    result_df = pd.DataFrame(result_dict)
+    result_df.to_csv("distance_metric_comparison.csv", index=False)
+    np.savez("distance_metric_comparison.npz", mean=mean_results, std=std_results, raw=results, metrics=[name for name, _ in distance_fns])
+    plt.figure(figsize=(10, 6))
+    x = np.arange(len(distance_fns))
+    plt.bar(x, mean_results, yerr=std_results, capsize=8, width=0.6)
+    plt.xticks(x, [name for name, _ in distance_fns], fontsize=18, fontweight='bold')
+    plt.yticks(fontsize=18, fontweight='bold')
+    plt.ylabel("Accuracy (%)", fontsize=18, fontweight='bold')
+    plt.title("Model Performance with Different Distance Metrics\n(Trained with Cosine Similarity)")
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.ylim(85, 100)
+    plt.tight_layout()
+    plt.savefig("distance_metric_comparison.png", dpi=300)
+    plt.show()
+    print("執行t-SNE分析以可視化不同距離度量下的嵌入向量關係...")
+    visualize_tsne_embeddings(model, test_data, N_WAY, K_SHOT, N_QUERY, distance_fns)
 
-# 保存實驗結果
-np.savez(f"{DATASET}_different_training_metrics_results.npz",
-         training_metrics=[name for name, _ in training_distances],
-         test_metrics=[name for name, _ in distance_fns],
-         results=all_training_results)
+def experiment_training_with_different_metrics():
+    training_distances = [
+        ("Cosine", cosine_similarity),
+        ("L-1", l1_similarity_for_training),
+        ("L-inf", linf_similarity_for_training)
+    ]
+    all_training_results = np.zeros((len(training_distances), len(distance_fns), NUM_ITER_AVG))
+    trained_models = []
+    model_names = []
+    for train_idx, (train_name, train_fn) in enumerate(training_distances):
+        print(f"\n==== 使用 {train_name} 距離訓練模型 ====\n")
+        for it in range(NUM_ITER_AVG):
+            print(f"實驗 {it+1}/{NUM_ITER_AVG}")
+            if DATASET in ['omniglot', 'mnist']:
+                model = MANN(dataset=DATASET, quantize=False, out_dim=OUTPUT_DIM).to(DEVICE)
+            else:
+                model = EnhancedMANN(dataset=DATASET, quantize=False, out_dim=OUTPUT_DIM).to(DEVICE)
+            optimizer = optim.Adam(model.parameters(), lr=1e-3)
+            train_model(model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, EPISODES_PER_EPOCH,
+                        optimizer, nn.CrossEntropyLoss(), use_noise=False, distance_fn=train_fn)
+            if it == NUM_ITER_AVG - 1:
+                trained_models.append(model)
+                model_names.append(f"Trained with {train_name}")
+            for test_idx, (test_name, test_fn) in enumerate(distance_fns):
+                print(f"  測試 {test_name}")
+                acc = test_model_with_enforced_quantization(model, test_data, N_WAY, K_SHOT, N_QUERY, TEST_EPISODES, test_fn)
+                all_training_results[train_idx, test_idx, it] = acc
+        means = np.mean(all_training_results[train_idx], axis=1)
+        stds = np.std(all_training_results[train_idx], axis=1)
+        print(f"\n{train_name} 訓練結果:")
+        for i, (metric_name, _) in enumerate(distance_fns):
+            print(f"{metric_name}: {means[i]:.2f}% ± {stds[i]:.2f}%")
+    np.savez(f"{DATASET}_different_training_metrics_results.npz",
+             training_metrics=[name for name, _ in training_distances],
+             test_metrics=[name for name, _ in distance_fns],
+             results=all_training_results)
+    mean_results = np.mean(all_training_results, axis=2)
+    std_results = np.std(all_training_results, axis=2)
+    plt.figure(figsize=(12, 8))
+    bar_width = 0.25
+    x = np.arange(len(distance_fns))
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c']
+    for i, (train_name, _) in enumerate(training_distances):
+        plt.bar(x + i*bar_width - bar_width, mean_results[i, :],
+                yerr=std_results[i, :], capsize=5, width=bar_width,
+                color=colors[i], label=f"Trained with {train_name}")
+    plt.xlabel('Testing Distance Metric', fontsize=18, fontweight='bold')
+    plt.ylabel('Accuracy (%)', fontsize=18, fontweight='bold')
+    plt.title('Model Performance with Different Training and Testing Distance Metrics', fontsize=14)
+    plt.xticks(x, [name for name, _ in distance_fns], fontsize=18, fontweight='bold')
+    plt.yticks(fontsize=18, fontweight='bold')
+    plt.legend(loc='lower right')
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.ylim(85, 100)
+    plt.tight_layout()
+    plt.savefig(f"{DATASET}_testing_metrics_comparison.png", dpi=300)
+    plt.show()
+    print("\n正在生成t-SNE嵌入空間比較...")
+    visualize_tsne_for_different_training_metrics(
+        trained_models, 
+        model_names, 
+        test_data, 
+        N_WAY, 
+        K_SHOT, 
+        N_QUERY, 
+        distance_fns
+    )
 
-# 創建比較圖表
-# ... [保留原始的條形圖代碼]
+def experiment_lsh_bits_analysis():
+    print("\n重新訓練一個模型（cosine similarity）供 LSH bit 數量分析...")
+    lsh_bits_list = [16, 24, 32, 48, 64, 128, 256, 400, 512, 768, 1024, 1532, 2048, 3000, 4096, 8192]
+    lsh_accs_all = np.zeros((len(lsh_bits_list), NUM_ITER_AVG))
+    for idx, num_bits in enumerate(lsh_bits_list):
+        print(f"\nLSH bits = {num_bits}，進行 {NUM_ITER_AVG} 次訓練與測試...")
+        for it in range(NUM_ITER_AVG):
+            if DATASET in ['omniglot', 'mnist']:
+                lsh_model = MANN(dataset=DATASET, quantize=False, out_dim=OUTPUT_DIM).to(DEVICE)
+            else:
+                lsh_model = EnhancedMANN(dataset=DATASET, quantize=False, out_dim=OUTPUT_DIM).to(DEVICE)
+            lsh_optimizer = optim.Adam(lsh_model.parameters(), lr=1e-3)
+            train_model(
+                lsh_model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, EPISODES_PER_EPOCH,
+                lsh_optimizer, nn.CrossEntropyLoss(), use_noise=False, distance_fn=cosine_similarity
+            )
+            def lsh_fn(a, b, num_bits=num_bits):
+                return lsh_similarity(a, b, num_bits=num_bits)
+            acc = test_model_with_enforced_quantization(
+                lsh_model, test_data, N_WAY, K_SHOT, N_QUERY, TEST_EPISODES, lsh_fn
+            )
+            lsh_accs_all[idx, it] = acc
+            print(f"  第 {it+1} 次：{acc:.2f}%")
+    lsh_accs_mean = np.mean(lsh_accs_all, axis=1)
+    lsh_accs_std = np.std(lsh_accs_all, axis=1)
+    plt.figure(figsize=(8, 5))
+    plt.errorbar(lsh_bits_list, lsh_accs_mean, yerr=lsh_accs_std, marker='o', capsize=5)
+    plt.xscale("log")
+    plt.xlabel("Number of LSH bits")
+    plt.ylabel("Accuracy (%)")
+    plt.title("Effect of LSH Bit Number on Model Performance")
+    plt.grid(True, linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.savefig(f"{DATASET}_lsh_bits_analysis.png", dpi=300)
+    plt.show()
+    pd.DataFrame({
+        "lsh_bits": lsh_bits_list,
+        "mean_accuracy": lsh_accs_mean,
+        "std": lsh_accs_std
+    }).to_csv(f"{DATASET}_lsh_bits_analysis.csv", index=False)
+    print("LSH bit 數量分析已完成，結果已儲存。")
 
-# 生成t-SNE可視化比較
-print("\n正在生成t-SNE嵌入空間比較...")
-visualize_tsne_for_different_training_metrics(
-    trained_models, 
-    model_names, 
-    test_data, 
-    N_WAY, 
-    K_SHOT, 
-    N_QUERY, 
-    distance_fns
-)
-
-# 计算每个训练-测试度量组合的平均值和标准差
-mean_results = np.mean(all_training_results, axis=2)  # 平均值
-std_results = np.std(all_training_results, axis=2)    # 标准差
-
-# 设置图形大小
-plt.figure(figsize=(12, 8))
-
-# 设置条形图的位置和宽度
-bar_width = 0.25
-x = np.arange(len(distance_fns))
-
-# 创建不同颜色的条形图，每个条代表一种训练度量
-colors = ['#1f77b4', '#ff7f0e', '#2ca02c']  # 蓝、橙、绿
-for i, (train_name, _) in enumerate(training_distances):
-    plt.bar(x + i*bar_width - bar_width, mean_results[i, :], 
-            yerr=std_results[i, :], capsize=5, width=bar_width, 
-            color=colors[i], label=f"Trained with {train_name}")
-
-# 添加图例、标题和标签
-plt.xlabel('Testing Distance Metric', fontsize=12)
-plt.ylabel('Accuracy (%)', fontsize=12)
-plt.title('Model Performance with Different Training and Testing Distance Metrics', fontsize=14)
-plt.xticks(x, [name for name, _ in distance_fns])
-plt.legend(loc='lower right')
-
-# 设置网格线
-plt.grid(axis='y', linestyle='--', alpha=0.7)
-
-# 设置y轴范围，只显示90%以上的准确率部分
-plt.ylim(65, 90)
-
-plt.tight_layout()
-plt.savefig(f"{DATASET}_testing_metrics_comparison.png", dpi=300)
-plt.show()
-
-# -------------------------------
-# LSH bit 數量對 performance 的分析
-# -------------------------------
-
-# 重新訓練一個用 cosine similarity 的模型，專門給 LSH bit 數量分析用
-print("\n重新訓練一個模型（cosine similarity）供 LSH bit 數量分析...")
-if DATASET in ['omniglot', 'mnist']:
-    lsh_model = MANN(dataset=DATASET, quantize=False, out_dim=OUTPUT_DIM).to(DEVICE)
-else:
-    lsh_model = EnhancedMANN(dataset=DATASET, quantize=False, out_dim=OUTPUT_DIM).to(DEVICE)
-lsh_optimizer = optim.Adam(lsh_model.parameters(), lr=1e-3)
-train_model(
-    lsh_model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, EPISODES_PER_EPOCH,
-    lsh_optimizer, nn.CrossEntropyLoss(), use_noise=False, distance_fn=cosine_similarity
-)
-
-print("\n分析不同 LSH bit 數量對 cosine similarity 訓練模型的 performance...")
-
-lsh_bits_list = [16, 24, 32, 48, 64, 128, 256, 400, 512, 768, 1024, 1532, 2048, 3000, 4096, 8192]
-lsh_accs_all = np.zeros((len(lsh_bits_list), NUM_ITER_AVG))
-
-for idx, num_bits in enumerate(lsh_bits_list):
-    print(f"\nLSH bits = {num_bits}，進行 {NUM_ITER_AVG} 次訓練與測試...")
+def experiment_cosine_hamming_lsh_avg():
+    print("\n=== 額外測試：Cosine similarity 訓練模型在 Cosine, Hamming, LSH 距離下的表現 (多次平均) ===")
+    extra_test_metrics = [
+        ("Cosine", cosine_similarity),
+        ("LSH (Same Output Bit)", lambda a, b: lsh_similarity(a, b, num_bits=OUTPUT_DIM*8)),
+        ("LSH (Same Output Dim)", lambda a, b: lsh_similarity(a, b, num_bits=OUTPUT_DIM*8)),
+        ("Hamming", hamming_distance),
+    ]
+    extra_results = np.zeros((len(extra_test_metrics), NUM_ITER_AVG))
     for it in range(NUM_ITER_AVG):
-        # 重新訓練模型
+        print(f"\n[Iteration {it+1}/{NUM_ITER_AVG}]")
         if DATASET in ['omniglot', 'mnist']:
-            lsh_model = MANN(dataset=DATASET, quantize=False, out_dim=OUTPUT_DIM).to(DEVICE)
+            extra_model = MANN(dataset=DATASET, quantize=False, out_dim=OUTPUT_DIM).to(DEVICE)
         else:
-            lsh_model = EnhancedMANN(dataset=DATASET, quantize=False, out_dim=OUTPUT_DIM).to(DEVICE)
-        lsh_optimizer = optim.Adam(lsh_model.parameters(), lr=1e-3)
+            extra_model = EnhancedMANN(dataset=DATASET, quantize=False, out_dim=OUTPUT_DIM).to(DEVICE)
+        extra_optimizer = optim.Adam(extra_model.parameters(), lr=1e-3)
         train_model(
-            lsh_model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, EPISODES_PER_EPOCH,
-            lsh_optimizer, nn.CrossEntropyLoss(), use_noise=False, distance_fn=cosine_similarity
+            extra_model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, EPISODES_PER_EPOCH,
+            extra_optimizer, nn.CrossEntropyLoss(), use_noise=False, distance_fn=cosine_similarity
         )
-        # 測試
-        def lsh_fn(a, b, num_bits=num_bits):
-            return lsh_similarity(a, b, num_bits=num_bits)
-        acc = test_model_with_enforced_quantization(
-            lsh_model, test_data, N_WAY, K_SHOT, N_QUERY, TEST_EPISODES, lsh_fn
-        )
-        lsh_accs_all[idx, it] = acc
-        print(f"  第 {it+1} 次：{acc:.2f}%")
+        for i, (name, fn) in enumerate(extra_test_metrics):
+            acc = test_model_with_enforced_quantization(
+                extra_model, test_data, N_WAY, K_SHOT, N_QUERY, TEST_EPISODES, fn
+            )
+            extra_results[i, it] = acc
+            print(f"  {name} distance accuracy: {acc:.2f}%")
+    extra_mean = np.mean(extra_results, axis=1)
+    extra_std = np.std(extra_results, axis=1)
+    print("\n=== 額外測試平均結果 ===")
+    for i, (name, _) in enumerate(extra_test_metrics):
+        print(f"{name}: {extra_mean[i]:.2f}% ± {extra_std[i]:.2f}%")
+    plt.figure(figsize=(7, 5))
+    x = np.arange(len(extra_test_metrics))
+    plt.bar(x, extra_mean, yerr=extra_std, capsize=8, width=0.6, color=['#1f77b4', '#ff7f0e', '#2ca02c'])
+    plt.xticks(x, [name for name, _ in extra_test_metrics], fontsize=16, fontweight='bold')
+    plt.yticks(fontsize=16, fontweight='bold')
+    plt.ylabel("Accuracy (%)", fontsize=16, fontweight='bold')
+    plt.title("Cosine-trained Model on Different Distance Metrics", fontsize=14)
+    plt.ylim(75, 85)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.savefig(f"{DATASET}_extra_distance_metrics.png", dpi=300)
+    plt.show()
 
-# 計算平均與標準差
-lsh_accs_mean = np.mean(lsh_accs_all, axis=1)
-lsh_accs_std = np.std(lsh_accs_all, axis=1)
-
-# 畫圖
-plt.figure(figsize=(8, 5))
-plt.errorbar(lsh_bits_list, lsh_accs_mean, yerr=lsh_accs_std, marker='o', capsize=5)
-plt.xscale("log")
-plt.xlabel("Number of LSH bits")
-plt.ylabel("Accuracy (%)")
-plt.title("Effect of LSH Bit Number on Model Performance\n(Trained & Tested 10x Each)")
-plt.grid(True, linestyle='--', alpha=0.7)
-plt.tight_layout()
-plt.savefig(f"{DATASET}_lsh_bits_analysis.png", dpi=300)
-plt.show()
-
-# 存成 csv
-import pandas as pd
-pd.DataFrame({
-    "lsh_bits": lsh_bits_list,
-    "mean_accuracy": lsh_accs_mean,
-    "std": lsh_accs_std
-}).to_csv(f"{DATASET}_lsh_bits_analysis.csv", index=False)
-print("LSH bit 數量分析已完成，結果已儲存。")
-print("所有實驗、比較和可視化已完成！")
+# -------------------------------
+# 主程式
+# -------------------------------
+if __name__ == "__main__":
+    # experiment_main_distance_metrics()
+    # experiment_training_with_different_metrics()
+    # experiment_lsh_bits_analysis()
+    experiment_cosine_hamming_lsh_avg()
+    print("所有實驗、比較和可視化已完成！")
