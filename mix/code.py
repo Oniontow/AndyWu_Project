@@ -22,12 +22,12 @@ N_WAY = 5
 K_SHOT = 1
 N_QUERY = 5
 NUM_EPOCHS = 100
-EPISODES_PER_EPOCH = 10
-TEST_EPISODES = 500
-NOISE_STD_MIN = 1
+EPISODES_PER_EPOCH = 11
+TEST_EPISODES = 200
+NOISE_STD_MIN = 0.2
 NOISE_LEVELS = np.concatenate([np.linspace(0, 9, 10), np.logspace(1, 3, 21)])
 NUM_NOISE = len(NOISE_LEVELS)
-NUM_ITER_AVG = 10
+NUM_ITER_AVG = 5
 OUTPUT_DIM = 32 if DATASET in ['omniglot', 'mnist'] else 1024
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -318,6 +318,10 @@ def linf_distance(a, b):
 def l1_distance(a, b):
     dist = torch.sum(torch.abs(a.unsqueeze(1) - b.unsqueeze(0)), dim=2)
     return -dist
+def l2_distance(a, b):
+    """L2距離函數"""
+    dist = torch.norm(a.unsqueeze(1) - b.unsqueeze(0), p=2, dim=2)
+    return -dist  # 轉換為相似度
 
 def l1_similarity_for_training(a, b):
     distances = torch.sum(torch.abs(a.unsqueeze(1) - b.unsqueeze(0)), dim=2)
@@ -728,15 +732,22 @@ def sample_episode(data_by_class, n_way, k_shot, n_query):
 # Training & Testing Functions
 # -------------------------------
 def train_model(model, data_by_class, n_way, k_shot, n_query, num_epochs, episodes_per_epoch, 
-               optimizer, criterion, use_noise=False, noise_std=1.0, is_bayesian=False, distance_fn=cosine_similarity):
+               optimizer, criterion, use_noise=False, noise_std=0.1, is_bayesian=False, distance_fn=cosine_similarity):
     return train_model_with_progress(model, data_by_class, n_way, k_shot, n_query, num_epochs, 
                                    episodes_per_epoch, optimizer, criterion, use_noise, noise_std, is_bayesian, distance_fn)
 
 # 添加進度監控的訓練函數
 def train_model_with_progress(model, data_by_class, n_way, k_shot, n_query, num_epochs, 
                              episodes_per_epoch, optimizer, criterion, use_noise=False, 
-                             noise_std=1.0, is_bayesian=False, distance_fn=cosine_similarity):
-    """帶進度監控的訓練函數"""
+                             noise_std=0.1, is_bayesian=False, distance_fn=cosine_similarity,
+                             noise_multiplier_mean=2.0, noise_multiplier_std=0.5):
+    """
+    帶進度監控的訓練函數
+    
+    Args:
+        noise_multiplier_mean: 高斯分佈倍率的均值
+        noise_multiplier_std: 高斯分佈倍率的標準差
+    """
     model.train()
     for epoch in range(num_epochs):
         if epoch % 10 == 0:  # 每10個epoch顯示一次進度
@@ -753,14 +764,35 @@ def train_model_with_progress(model, data_by_class, n_way, k_shot, n_query, num_
                 query_emb = model(query_imgs)
                 
                 if use_noise:
-                    support_emb = support_emb + torch.randn_like(support_emb) * noise_std
-                    query_emb = query_emb + torch.randn_like(query_emb) * noise_std
+                    # 為每個嵌入向量的每個維度生成高斯倍率
+                    # 使用乘法噪聲而非加法噪聲
+                    gaussian_multiplier_support = torch.normal(
+                        mean=noise_multiplier_mean, 
+                        std=noise_multiplier_std, 
+                        size=support_emb.shape, 
+                        device=DEVICE
+                    )
+                    
+                    gaussian_multiplier_query = torch.normal(
+                        mean=noise_multiplier_mean, 
+                        std=noise_multiplier_std, 
+                        size=query_emb.shape, 
+                        device=DEVICE
+                    )
+                    
+                    # 確保倍率為正數（可選：也可以允許負值）
+                    gaussian_multiplier_support = torch.clamp(gaussian_multiplier_support, min=0.1)
+                    gaussian_multiplier_query = torch.clamp(gaussian_multiplier_query, min=0.1)
+                    
+                    # 使用乘法噪聲：embedding = embedding * gaussian_multiplier
+                    support_emb = support_emb * gaussian_multiplier_support
+                    query_emb = query_emb * gaussian_multiplier_query
 
                 # 使用指定的距離函數
                 scores = distance_fn(query_emb, support_emb)
                 
                 if is_bayesian:
-                    beta = min(1, (epoch + 1) / num_epochs) * 0.2
+                    beta = min(1, (epoch + 1) / num_epochs) / 100000
                     loss = bayesian_loss(model, criterion, scores, query_labels, beta)
                 else:
                     loss = criterion(scores, query_labels)
@@ -921,7 +953,7 @@ def experiment_training_methods_comparison():
     """
     比較三種訓練方法：
     1. 普通MANN (訓練時使用cosine similarity)
-    2. Noise-aware training (訓練時在embedding加入高斯噪聲後再用cosine similarity)
+    2. Noise-aware training (訓練時在embedding使用高斯乘法噪聲後再用cosine similarity)
     3. Bayesian NN (使用貝葉斯層和KL loss)
     測試時都不加噪聲，但使用不同的距離度量
     """
@@ -932,25 +964,30 @@ def experiment_training_methods_comparison():
     # 定義訓練方法
     training_methods = [
         ("Standard MANN", "standard"),
-        ("Noise-aware MANN", "noise_aware"), 
+        ("Noise-Aware MANN", "noise_aware"), 
         ("Bayesian MANN", "bayesian")
     ]
     
     # 測試距離度量 - 增加LSH
     test_distance_fns = [
         ("Cosine", cosine_similarity),
+        ("L-2", l2_distance),
         ("L-1", l1_distance),
         ("L-inf", linf_distance),
-        
         ("LSH", lambda a, b: lsh_similarity(a, b, num_bits=OUTPUT_DIM*8)),
-        # ("Hamming", hamming_distance),
     ]
     
     # 結果存儲 [training_method, test_metric, iteration]
     all_results = np.zeros((len(training_methods), len(test_distance_fns), NUM_ITER_AVG))
     
-    # 噪聲標準差（用於noise-aware training）
-    training_noise_std = 1
+    # 乘法噪聲設定
+    noise_multiplier_mean = 1.0    # 高斯分佈倍率的均值（1.0表示不變）
+    noise_multiplier_std = 0.2     # 高斯分佈倍率的標準差
+    
+    print(f"Noise-Aware training 設定:")
+    print(f"  倍率分佈: N({noise_multiplier_mean}, {noise_multiplier_std}²)")
+    print(f"  每個維度都會乘以從此分佈採樣的倍率")
+    print(f"  理論倍率範圍約: [{noise_multiplier_mean - 2*noise_multiplier_std:.2f}, {noise_multiplier_mean + 2*noise_multiplier_std:.2f}] (95%)")
     
     for train_idx, (train_name, train_type) in enumerate(training_methods):
         print(f"\n==== 訓練方法: {train_name} ====")
@@ -984,22 +1021,24 @@ def experiment_training_methods_comparison():
                 print(f"  開始訓練...")
                 if train_type == "standard":
                     # 標準訓練
-                    train_model(model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, 
-                               EPISODES_PER_EPOCH, optimizer, criterion, 
-                               use_noise=False, is_bayesian=False, distance_fn=cosine_similarity)
-                               
+                    train_model_with_progress(model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, 
+                                            EPISODES_PER_EPOCH, optimizer, criterion, 
+                                            use_noise=False, is_bayesian=False, distance_fn=cosine_similarity)
+                                           
                 elif train_type == "noise_aware":
-                    # 噪聲感知訓練
-                    train_model(model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, 
-                               EPISODES_PER_EPOCH, optimizer, criterion, 
-                               use_noise=True, noise_std=training_noise_std, 
-                               is_bayesian=False, distance_fn=cosine_similarity)
-                               
+                    # 乘法噪聲訓練
+                    train_model_with_progress(model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, 
+                                            EPISODES_PER_EPOCH, optimizer, criterion, 
+                                            use_noise=True, noise_std=None,  # 不再使用noise_std
+                                            is_bayesian=False, distance_fn=cosine_similarity,
+                                            noise_multiplier_mean=noise_multiplier_mean,
+                                            noise_multiplier_std=noise_multiplier_std)
+                                           
                 elif train_type == "bayesian":
                     # 貝葉斯訓練
-                    train_model(model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, 
-                               EPISODES_PER_EPOCH, optimizer, criterion, 
-                               use_noise=False, is_bayesian=True, distance_fn=cosine_similarity)
+                    train_model_with_progress(model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, 
+                                            EPISODES_PER_EPOCH, optimizer, criterion, 
+                                            use_noise=False, is_bayesian=True, distance_fn=cosine_similarity)
                 
                 print(f"  訓練完成，開始測試...")
                 
@@ -1008,14 +1047,9 @@ def experiment_training_methods_comparison():
                 for test_idx, (test_name, test_fn) in enumerate(test_distance_fns):
                     print(f"    測試 {test_name}")
                     
-                    if test_name == "Cosine (No Quant)":
-                        # 不量化的測試
-                        acc = test_model_without_quantization(
-                            model, test_data, N_WAY, K_SHOT, N_QUERY, TEST_EPISODES, test_fn)
-                    else:
-                        # 量化的測試
-                        acc = test_model_with_enforced_quantization(
-                            model, test_data, N_WAY, K_SHOT, N_QUERY, TEST_EPISODES, test_fn)
+                    # 量化的測試
+                    acc = test_model_with_enforced_quantization(
+                        model, test_data, N_WAY, K_SHOT, N_QUERY, TEST_EPISODES, test_fn)
                     
                     all_results[train_idx, test_idx, it] = acc
                     iteration_results.append(acc)
@@ -1047,11 +1081,12 @@ def experiment_training_methods_comparison():
     
     # 保存結果
     print("\n保存實驗結果...")
-    np.savez(f"{DATASET}_training_methods_comparison.npz",
+    np.savez(f"{DATASET}_Noise-Aware_noise_training_comparison.npz",
              training_methods=[name for name, _ in training_methods],
              test_metrics=[name for name, _ in test_distance_fns],
              results=all_results,
-             training_noise_std=training_noise_std)
+             noise_multiplier_mean=noise_multiplier_mean,
+             noise_multiplier_std=noise_multiplier_std)
     
     # 計算平均結果和標準差（處理NaN值）
     mean_results = np.nanmean(all_results, axis=2)
@@ -1069,7 +1104,7 @@ def experiment_training_methods_comparison():
             })
     
     results_df = pd.DataFrame(detailed_results)
-    results_df.to_csv(f"{DATASET}_training_methods_detailed_results.csv", index=False)
+    results_df.to_csv(f"{DATASET}_Noise-Aware_training_detailed_results.csv", index=False)
     
     # 改善的可視化（增強字體樣式）
     print("\n生成結果可視化...")
@@ -1097,16 +1132,27 @@ def experiment_training_methods_comparison():
         
         plt.xlabel('Test Distance Metric', fontweight='bold', fontsize=14)
         plt.ylabel('Accuracy (%)', fontweight='bold', fontsize=14)
-        plt.ylim(70, 85)
+        plt.ylim(70, 80)
         plt.title('Performance Comparison', fontweight='bold', fontsize=16)
         plt.xticks(x, [name for name, _ in test_distance_fns], 
                   rotation=45, fontweight='bold', fontsize=12)
         plt.yticks(fontweight='bold', fontsize=12)
         plt.legend(prop={'weight': 'bold', 'size': 12})
         plt.grid(axis='y', linestyle='--', alpha=0.3)
+        
+        # 添加噪聲設定信息到圖上
+        info_text = f'Noise-Aware : Multiplier~N({noise_multiplier_mean},{noise_multiplier_std}²)'
+        plt.figtext(0.5, 0.02, info_text, ha='center', fontsize=10, style='italic')
+        
+        plt.savefig(f"{DATASET}_Noise-Aware_training_results.png", dpi=300, bbox_inches='tight')
+        plt.show()
     
     # 打印總結
     print("\n=== 實驗總結 ===")
+    print(f"Noise-Aware training 使用設定:")
+    print(f"  倍率分佈: N({noise_multiplier_mean}, {noise_multiplier_std}²)")
+    print(f"  噪聲類型: 乘法噪聲 (embedding * gaussian_multiplier)")
+    
     for i, (train_name, _) in enumerate(training_methods):
         valid_results = mean_results[i, ~np.isnan(mean_results[i, :])]
         if len(valid_results) > 0:
@@ -1117,13 +1163,6 @@ def experiment_training_methods_comparison():
                 best_std = std_results[i, best_idx]
                 print(f"\n{train_name}:")
                 print(f"  最佳測試度量: {best_metric} ({best_acc:.2f}% ± {best_std:.2f}%)")
-                
-                # 顯示量化影響（如果有Cosine相關結果）
-                if not np.isnan(mean_results[i, 0]) and not np.isnan(mean_results[i, 1]):
-                    cosine_quant = mean_results[i, 0]
-                    cosine_no_quant = mean_results[i, 1]
-                    quantization_impact = cosine_no_quant - cosine_quant
-                    print(f"  量化影響 (Cosine): {quantization_impact:+.2f}% (未量化: {cosine_no_quant:.2f}%, 量化: {cosine_quant:.2f}%)")
         else:
             print(f"\n{train_name}: 無有效結果")
     
@@ -1132,9 +1171,636 @@ def experiment_training_methods_comparison():
     
     return all_results, mean_results, std_results
 
+def experiment_snr_analysis():
+    """
+    SNR分析實驗：
+    1. 用cosine similarity訓練一個模型
+    2. 計算多種距離度量：cosine, L1, L2, L-inf, LSH
+    3. 將所有距離映射到[0,1]範圍
+    4. 以cosine distance作為信號，其他距離作為噪聲，計算SNR = |noisy signal - signal|/1
+    """
+    print("\n=== 信噪比(SNR)分析實驗 ===")
+    print(f"實驗設定: NUM_EPOCHS={NUM_EPOCHS}, EPISODES_PER_EPOCH={EPISODES_PER_EPOCH}")
+    
+    distance_functions = [
+        ("Cosine", cosine_similarity),
+        ("L1", l1_distance), 
+        ("L2", l2_distance),
+        ("L-inf", linf_distance),
+        ("LSH", lambda a, b: lsh_similarity(a, b, num_bits=OUTPUT_DIM*8))
+    ]
+    
+    # 存儲每個迭代的詳細SNR結果
+    all_iteration_snr_values = []  # 每個迭代的SNR值分布
+    snr_means_per_iteration = np.zeros((NUM_ITER_AVG, len(distance_functions)-1))
+    all_distances_normalized = []
+    
+    for iteration in range(NUM_ITER_AVG):
+        print(f"\n迭代 {iteration+1}/{NUM_ITER_AVG}")
+        
+        # 清理GPU記憶體
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        try:
+            # 創建並訓練模型
+            if DATASET in ['omniglot', 'mnist']:
+                model = MANN(dataset=DATASET, quantize=False, out_dim=OUTPUT_DIM).to(DEVICE)
+            else:
+                model = EnhancedMANN(dataset=DATASET, quantize=False, out_dim=OUTPUT_DIM).to(DEVICE)
+            
+            optimizer = optim.Adam(model.parameters(), lr=1e-3)
+            criterion = nn.CrossEntropyLoss()
+            
+            print("  訓練模型...")
+            train_model(model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, 
+                       EPISODES_PER_EPOCH, optimizer, criterion, 
+                       use_noise=False, is_bayesian=False, distance_fn=cosine_similarity)
+            
+            print("  收集距離數據...")
+            model.eval()
+            
+            # 收集大量測試episodes的距離數據
+            all_distance_matrices = {name: [] for name, _ in distance_functions}
+            
+            with torch.no_grad():
+                for episode in range(TEST_EPISODES):
+                    if episode % 100 == 0:
+                        print(f"    處理episode {episode}/{TEST_EPISODES}")
+                    
+                    # 採樣episode
+                    support_imgs, support_labels, query_imgs, query_labels = sample_episode(
+                        test_data, N_WAY, K_SHOT, N_QUERY)
+                    support_imgs = support_imgs.to(DEVICE)
+                    query_imgs = query_imgs.to(DEVICE)
+                    
+                    # 獲取嵌入向量
+                    support_emb = model(support_imgs)
+                    query_emb = model(query_imgs)
+                    
+                    # 量化嵌入向量（保持一致性）
+                    support_emb_q, query_emb_q = apply_consistent_quantization(support_emb, query_emb)
+                    
+                    # 計算所有距離度量
+                    for dist_name, dist_fn in distance_functions:
+                        if dist_name == "Cosine":
+                            # 對於cosine，我們計算距離（1-相似度）
+                            similarity_matrix = dist_fn(query_emb_q, support_emb_q)
+                            distance_matrix = 1.0 - similarity_matrix
+                        else:
+                            # 對於其他距離，轉換負的相似度為正的距離
+                            similarity_matrix = dist_fn(query_emb_q, support_emb_q)
+                            distance_matrix = -similarity_matrix
+                        
+                        # 收集距離值（展平為一維）
+                        distances_flat = distance_matrix.cpu().numpy().flatten()
+                        all_distance_matrices[dist_name].extend(distances_flat)
+            
+            print("  計算SNR...")
+            
+            # 將所有距離轉換為numpy數組
+            for dist_name in all_distance_matrices:
+                all_distance_matrices[dist_name] = np.array(all_distance_matrices[dist_name])
+            
+            # 歸一化所有距離到[0,1]範圍
+            normalized_distances = {}
+            for dist_name, distances in all_distance_matrices.items():
+                # 使用min-max歸一化
+                min_val = np.min(distances)
+                max_val = np.max(distances)
+                if max_val > min_val:
+                    normalized = (distances - min_val) / (max_val - min_val)
+                else:
+                    normalized = np.zeros_like(distances)
+                normalized_distances[dist_name] = normalized
+                
+                print(f"    {dist_name}: Original range [{min_val:.4f}, {max_val:.4f}] -> Normalized range [{np.min(normalized):.4f}, {np.max(normalized):.4f}]")
+            
+            # 以Cosine distance作為信號
+            signal = normalized_distances["Cosine"]
+            
+            # 存儲這個迭代的SNR值
+            iteration_snr_values = {}
+            
+            # 計算每個其他距離度量與cosine的SNR
+            iteration_snr_means = []
+            for i, (dist_name, _) in enumerate(distance_functions[1:]):  # 跳過cosine
+                noisy_signal = normalized_distances[dist_name]
+                
+                # 計算SNR = |noisy signal - signal| / 1
+                snr_values = np.abs(noisy_signal - signal) / 1.0
+                
+                # 計算這個距離度量的平均SNR
+                mean_snr = np.mean(snr_values)
+                iteration_snr_means.append(mean_snr)
+                
+                # 存儲所有SNR值用於分布分析
+                iteration_snr_values[dist_name] = snr_values
+                
+                print(f"    SNR (|{dist_name} - Cosine|/1): 平均 = {mean_snr:.4f}, 標準差 = {np.std(snr_values):.4f}")
+            
+            snr_means_per_iteration[iteration] = iteration_snr_means
+            all_iteration_snr_values.append(iteration_snr_values)
+            
+            # 保存第一次迭代的歸一化距離（用於可視化）
+            if iteration == 0:
+                all_distances_normalized = normalized_distances.copy()
+            
+            # 清理記憶體
+            del model, optimizer
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+        except Exception as e:
+            print(f"迭代 {iteration+1} 發生錯誤: {str(e)}")
+            snr_means_per_iteration[iteration] = np.full(len(distance_functions)-1, np.nan)
+            all_iteration_snr_values.append({})
+            continue
+    
+    # 計算總體統計
+    mean_snr = np.nanmean(snr_means_per_iteration, axis=0)
+    std_snr = np.nanstd(snr_means_per_iteration, axis=0)
+    
+    print("\n=== SNR分析結果 (|noisy signal - signal|/1) ===")
+    for i, (dist_name, _) in enumerate(distance_functions[1:]):
+        print(f"{dist_name}: 平均SNR = {mean_snr[i]:.4f} ± {std_snr[i]:.4f}")
+    
+    # 保存結果
+    np.savez(f"{DATASET}_snr_analysis.npz",
+             distance_names=[name for name, _ in distance_functions[1:]],
+             snr_means_per_iteration=snr_means_per_iteration,
+             mean_snr=mean_snr,
+             std_snr=std_snr,
+             all_iteration_snr_values=all_iteration_snr_values)
+    
+    # 可視化結果 - 分開繪製
+    print("\n生成SNR可視化...")
+    colors = ['#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
+    
+    # 圖1: Mean SNR Comparison
+    plt.figure(figsize=(12, 8))
+    x_pos = np.arange(len(distance_functions)-1)
+    
+    bars = plt.bar(x_pos, mean_snr, yerr=std_snr, capsize=5, 
+                   color=colors, alpha=0.8, edgecolor='black', linewidth=1)
+    
+    plt.xlabel('Distance Metric', fontweight='bold', fontsize=14)
+    plt.ylabel('SNR (|noisy-signal|/1)', fontweight='bold', fontsize=14)
+    plt.title('Mean SNR Comparison\n(|noisy signal - signal|/1)', fontweight='bold', fontsize=16)
+    plt.xticks(x_pos, [name for name, _ in distance_functions[1:]], rotation=45, fontsize=12)
+    plt.yticks(fontsize=12)
+    plt.grid(axis='y', alpha=0.3)
+    
+    # 在柱子上添加數值標籤
+    for i, (bar, mean_val, std_val) in enumerate(zip(bars, mean_snr, std_snr)):
+        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + std_val + 0.002,
+                f'{mean_val:.3f}', ha='center', va='bottom', fontweight='bold', fontsize=10)
+    
+    plt.tight_layout()
+    plt.savefig(f"{DATASET}_snr_mean_comparison.png", dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # 圖2-5: 每個距離度量的SNR值分布直方圖
+    if all_iteration_snr_values and len(all_iteration_snr_values) > 0:
+        first_iteration_snr = all_iteration_snr_values[0]
+        
+        for idx, (dist_name, _) in enumerate(distance_functions[1:]):
+            if dist_name in first_iteration_snr and len(first_iteration_snr[dist_name]) > 0:
+                plt.figure(figsize=(10, 6))
+                
+                snr_values = first_iteration_snr[dist_name]
+                plt.hist(snr_values, bins=50, alpha=0.7, color=colors[idx], 
+                        density=True, edgecolor='black', linewidth=0.5)
+                
+                # 添加統計信息
+                mean_val = np.mean(snr_values)
+                std_val = np.std(snr_values)
+                median_val = np.median(snr_values)
+                
+                plt.axvline(mean_val, color='red', linestyle='--', linewidth=2, 
+                           label=f'Mean: {mean_val:.3f}')
+                plt.axvline(median_val, color='blue', linestyle='-.', linewidth=2, 
+                           label=f'Median: {median_val:.3f}')
+                plt.axvline(mean_val + std_val, color='red', linestyle=':', linewidth=1, alpha=0.7)
+                plt.axvline(mean_val - std_val, color='red', linestyle=':', linewidth=1, alpha=0.7)
+                
+                plt.xlabel('SNR Value', fontweight='bold', fontsize=14)
+                plt.ylabel('Density', fontweight='bold', fontsize=14)
+                plt.title(f'{dist_name} SNR Distribution\n(First Iteration)', fontweight='bold', fontsize=16)
+                plt.legend(fontsize=12)
+                plt.grid(alpha=0.3)
+                
+                # 添加統計文本框
+                stats_text = f'Statistics:\nMean: {mean_val:.4f}\nStd: {std_val:.4f}\nMedian: {median_val:.4f}\nMin: {np.min(snr_values):.4f}\nMax: {np.max(snr_values):.4f}'
+                plt.text(0.02, 0.98, stats_text, transform=plt.gca().transAxes, 
+                        fontsize=10, verticalalignment='top', 
+                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+                
+                plt.tight_layout()
+                plt.savefig(f"{DATASET}_snr_distribution_{dist_name.lower().replace('-', '_')}.png", dpi=300, bbox_inches='tight')
+                plt.show()
+    
+    # 圖6: 所有距離度量的SNR分布比較（箱線圖）
+    plt.figure(figsize=(12, 8))
+    snr_data_for_boxplot = []
+    labels_for_boxplot = []
+    
+    for i, (dist_name, _) in enumerate(distance_functions[1:]):
+        valid_iterations = snr_means_per_iteration[:, i][~np.isnan(snr_means_per_iteration[:, i])]
+        if len(valid_iterations) > 0:
+            snr_data_for_boxplot.append(valid_iterations)
+            labels_for_boxplot.append(dist_name)
+    
+    if snr_data_for_boxplot:
+        bp = plt.boxplot(snr_data_for_boxplot, labels=labels_for_boxplot, patch_artist=True, 
+                        showmeans=True, meanline=True)
+        
+        # 自定義箱線圖顏色
+        for patch, color in zip(bp['boxes'], colors[:len(snr_data_for_boxplot)]):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.7)
+        
+        # 設置均值線顏色
+        for meanline in bp['means']:
+            meanline.set_color('red')
+            meanline.set_linewidth(2)
+    
+    plt.xlabel('Distance Metric', fontweight='bold', fontsize=14)
+    plt.ylabel('SNR Distribution Across Iterations', fontweight='bold', fontsize=14)
+    plt.title('SNR Distribution Comparison\n(Across All Iterations)', fontweight='bold', fontsize=16)
+    plt.xticks(rotation=45, fontsize=12)
+    plt.yticks(fontsize=12)
+    plt.grid(axis='y', alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(f"{DATASET}_snr_boxplot_comparison.png", dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # 圖7: SNR隨迭代變化的線圖
+    plt.figure(figsize=(12, 8))
+    for i, (dist_name, _) in enumerate(distance_functions[1:]):
+        valid_snr = snr_means_per_iteration[:, i][~np.isnan(snr_means_per_iteration[:, i])]
+        if len(valid_snr) > 0:
+            plt.plot(range(1, len(valid_snr)+1), valid_snr, 
+                    marker='o', label=dist_name, color=colors[i], 
+                    linewidth=2, markersize=8)
+    
+    plt.xlabel('Iteration', fontweight='bold', fontsize=14)
+    plt.ylabel('Mean SNR', fontweight='bold', fontsize=14)
+    plt.title('SNR Consistency Across Iterations', fontweight='bold', fontsize=16)
+    plt.legend(fontsize=12)
+    plt.grid(alpha=0.3)
+    plt.xticks(fontsize=12)
+    plt.yticks(fontsize=12)
+    
+    plt.tight_layout()
+    plt.savefig(f"{DATASET}_snr_iteration_trends.png", dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # 創建詳細結果表格
+    detailed_results = []
+    for i, (dist_name, _) in enumerate(distance_functions[1:]):
+        valid_iterations = snr_means_per_iteration[:, i][~np.isnan(snr_means_per_iteration[:, i])]
+        detailed_results.append({
+            'Distance_Metric': dist_name,
+            'Mean_SNR': mean_snr[i],
+            'Std_SNR': std_snr[i],
+            'Min_SNR': np.min(valid_iterations) if len(valid_iterations) > 0 else np.nan,
+            'Max_SNR': np.max(valid_iterations) if len(valid_iterations) > 0 else np.nan,
+            'Median_SNR': np.median(valid_iterations) if len(valid_iterations) > 0 else np.nan,
+            'Valid_Iterations': len(valid_iterations)
+        })
+    
+    results_df = pd.DataFrame(detailed_results)
+    results_df.to_csv(f"{DATASET}_snr_analysis_detailed_results.csv", index=False)
+    
+    # 保存每個迭代的詳細SNR分布數據
+    iteration_details = []
+    for iteration in range(NUM_ITER_AVG):
+        if iteration < len(all_iteration_snr_values):
+            for dist_name in all_iteration_snr_values[iteration]:
+                snr_values = all_iteration_snr_values[iteration][dist_name]
+                iteration_details.append({
+                    'Iteration': iteration + 1,
+                    'Distance_Metric': dist_name,
+                    'Mean_SNR': np.mean(snr_values),
+                    'Std_SNR': np.std(snr_values),
+                    'Min_SNR': np.min(snr_values),
+                    'Max_SNR': np.max(snr_values),
+                    'Median_SNR': np.median(snr_values),
+                    'Q25_SNR': np.percentile(snr_values, 25),
+                    'Q75_SNR': np.percentile(snr_values, 75)
+                })
+    
+    iteration_df = pd.DataFrame(iteration_details)
+    iteration_df.to_csv(f"{DATASET}_snr_iteration_details.csv", index=False)
+    
+    print("\n詳細結果已保存到CSV文件")
+    print("\n=== 實驗總結 ===")
+    
+    # 找出最佳和最差的距離度量（SNR越小越好）
+    best_idx = np.argmin(mean_snr)
+    worst_idx = np.argmax(mean_snr)
+    
+    print(f"最低SNR（最相似）: {distance_functions[best_idx + 1][0]} ({mean_snr[best_idx]:.4f} ± {std_snr[best_idx]:.4f})")
+    print(f"最高SNR（最不同）: {distance_functions[worst_idx + 1][0]} ({mean_snr[worst_idx]:.4f} ± {std_snr[worst_idx]:.4f})")
+    print(f"SNR範圍: {np.max(mean_snr) - np.min(mean_snr):.4f}")
+    
+    # 打印每個度量的詳細統計
+    print("\n詳細統計:")
+    for i, (dist_name, _) in enumerate(distance_functions[1:]):
+        valid_iterations = snr_means_per_iteration[:, i][~np.isnan(snr_means_per_iteration[:, i])]
+        if len(valid_iterations) > 0:
+            print(f"{dist_name}:")
+            print(f"  平均: {mean_snr[i]:.4f}")
+            print(f"  標準差: {std_snr[i]:.4f}")
+            print(f"  範圍: [{np.min(valid_iterations):.4f}, {np.max(valid_iterations):.4f}]")
+            print(f"  中位數: {np.median(valid_iterations):.4f}")
+    
+    return snr_means_per_iteration, mean_snr, std_snr, all_iteration_snr_values, all_distances_normalized
+
+def experiment_noise_multiplier_sweep():
+    """
+    Noise multiplier mean sweep experiment:
+    Use only Noise-aware training method, sweep noise multiplier mean from 0 to 3 (step 0.1)
+    Test performance of all distance metrics
+    """
+    print("\n=== Noise Multiplier Mean Sweep Experiment ===")
+    print(f"Experiment settings: NUM_EPOCHS={NUM_EPOCHS}, EPISODES_PER_EPOCH={EPISODES_PER_EPOCH}")
+    print(f"TEST_EPISODES={TEST_EPISODES}, NUM_ITER_AVG={NUM_ITER_AVG}")
+    
+    # Define noise multiplier mean range
+    noise_means = np.arange(0.0, 3.1, 0.1)  # 0.0 to 3.0, step 0.1
+    noise_multiplier_std = 0.2  # Fixed standard deviation
+    
+    print(f"Noise multiplier mean range: {noise_means[0]:.1f} to {noise_means[-1]:.1f} ({len(noise_means)} values)")
+    print(f"Fixed standard deviation: {noise_multiplier_std}")
+    
+    # Test distance metrics
+    test_distance_fns = [
+        ("Cosine", cosine_similarity),
+        ("L-2", l2_distance), 
+        ("L-1", l1_distance),
+        ("L-inf", linf_distance),
+        ("LSH", lambda a, b: lsh_similarity(a, b, num_bits=OUTPUT_DIM*8)),
+    ]
+    
+    # Result storage [noise_mean_idx, test_metric, iteration]
+    all_results = np.zeros((len(noise_means), len(test_distance_fns), NUM_ITER_AVG))
+    
+    for noise_idx, noise_mean in enumerate(noise_means):
+        print(f"\n==== Noise Multiplier Mean: {noise_mean:.1f} ({noise_idx+1}/{len(noise_means)}) ====")
+        print(f"Current setting: Multiplier distribution N({noise_mean:.1f}, {noise_multiplier_std}²)")
+        
+        for it in range(NUM_ITER_AVG):
+            print(f"  Iteration {it+1}/{NUM_ITER_AVG}")
+            
+            # Ensure GPU memory cleanup after each iteration
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            try:
+                # Create model
+                if DATASET in ['omniglot', 'mnist']:
+                    model = MANN(dataset=DATASET, quantize=False, out_dim=OUTPUT_DIM).to(DEVICE)
+                else:
+                    model = EnhancedMANN(dataset=DATASET, quantize=False, out_dim=OUTPUT_DIM).to(DEVICE)
+                
+                optimizer = optim.Adam(model.parameters(), lr=1e-3)
+                criterion = nn.CrossEntropyLoss()
+                
+                # Use Noise-aware training
+                print(f"    Starting training (noise_mean={noise_mean:.1f})...")
+                train_model_with_progress(model, train_data, N_WAY, K_SHOT, N_QUERY, NUM_EPOCHS, 
+                                        EPISODES_PER_EPOCH, optimizer, criterion, 
+                                        use_noise=True, noise_std=None,
+                                        is_bayesian=False, distance_fn=cosine_similarity,
+                                        noise_multiplier_mean=noise_mean,
+                                        noise_multiplier_std=noise_multiplier_std)
+                
+                print(f"    Training completed, starting testing...")
+                
+                # Test different distance metrics
+                iteration_results = []
+                for test_idx, (test_name, test_fn) in enumerate(test_distance_fns):
+                    print(f"      Testing {test_name}")
+                    
+                    # Quantized testing
+                    acc = test_model_with_enforced_quantization(
+                        model, test_data, N_WAY, K_SHOT, N_QUERY, TEST_EPISODES, test_fn)
+                    
+                    all_results[noise_idx, test_idx, it] = acc
+                    iteration_results.append(acc)
+                    print(f"        Accuracy: {acc:.2f}%")
+                
+                # Clean up current model to free memory
+                del model, optimizer
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    
+            except Exception as e:
+                print(f"    Iteration {it+1} error: {str(e)}")
+                # Fill NaN values to maintain result matrix integrity
+                for test_idx in range(len(test_distance_fns)):
+                    all_results[noise_idx, test_idx, it] = np.nan
+                continue
+        
+        # Print current noise mean results (ignore NaN values)
+        valid_results = all_results[noise_idx, :, ~np.isnan(all_results[noise_idx, 0, :])]
+        if valid_results.size > 0:
+            means = np.nanmean(all_results[noise_idx], axis=1)
+            stds = np.nanstd(all_results[noise_idx], axis=1)
+            print(f"\n  Noise Mean {noise_mean:.1f} Results:")
+            for i, (test_name, _) in enumerate(test_distance_fns):
+                if not np.isnan(means[i]):
+                    print(f"    {test_name}: {means[i]:.2f}% ± {stds[i]:.2f}%")
+                else:
+                    print(f"    {test_name}: No valid results")
+    
+    # Save results
+    print("\nSaving experiment results...")
+    np.savez(f"{DATASET}_noise_multiplier_sweep.npz",
+             noise_means=noise_means,
+             noise_multiplier_std=noise_multiplier_std,
+             test_metrics=[name for name, _ in test_distance_fns],
+             results=all_results)
+    
+    # Calculate average results and standard deviation (handle NaN values)
+    mean_results = np.nanmean(all_results, axis=2)
+    std_results = np.nanstd(all_results, axis=2)
+    
+    # Create detailed results DataFrame
+    detailed_results = []
+    for i, noise_mean in enumerate(noise_means):
+        for j, (test_name, _) in enumerate(test_distance_fns):
+            detailed_results.append({
+                'Noise_Multiplier_Mean': noise_mean,
+                'Test_Metric': test_name,
+                'Mean_Accuracy': mean_results[i, j] if not np.isnan(mean_results[i, j]) else None,
+                'Std_Dev': std_results[i, j] if not np.isnan(std_results[i, j]) else None
+            })
+    
+    results_df = pd.DataFrame(detailed_results)
+    results_df.to_csv(f"{DATASET}_noise_multiplier_sweep_detailed_results.csv", index=False)
+    
+    # Visualization - Bar chart with noise means as grouped bars
+    print("\nGenerating result visualization...")
+    
+    # Select specific noise means for cleaner visualization (every 0.5)
+    selected_noise_indices = [i for i, nm in enumerate(noise_means) if nm % 0.5 == 0]
+    selected_noise_means = noise_means[selected_noise_indices]
+    selected_mean_results = mean_results[selected_noise_indices, :]
+    selected_std_results = std_results[selected_noise_indices, :]
+    
+    plt.figure(figsize=(20, 12))
+    
+    # Color map for different noise means
+    colors = plt.cm.viridis(np.linspace(0, 1, len(selected_noise_means)))
+    
+    # Bar width and positions
+    bar_width = 0.12
+    x_pos = np.arange(len(test_distance_fns))
+    
+    # Plot bars for each noise mean
+    for i, (noise_mean, color) in enumerate(zip(selected_noise_means, colors)):
+        # Get results for this noise mean across all metrics
+        accuracies = selected_mean_results[i, :]
+        errors = selected_std_results[i, :]
+        
+        # Filter out NaN values
+        valid_mask = ~np.isnan(accuracies)
+        if np.any(valid_mask):
+            positions = x_pos + i * bar_width - (len(selected_noise_means) - 1) * bar_width / 2
+            
+            bars = plt.bar(positions[valid_mask], accuracies[valid_mask], 
+                          width=bar_width, color=color, alpha=0.8,
+                          yerr=errors[valid_mask], capsize=3,
+                          label=f'Noise Mean = {noise_mean:.1f}',
+                          edgecolor='black', linewidth=0.5)
+    
+    plt.xlabel('Distance Metric', fontweight='bold', fontsize=16)
+    plt.ylabel('Accuracy (%)', fontweight='bold', fontsize=16)
+    plt.title(f'Performance vs Noise Multiplier Mean\n(std={noise_multiplier_std})', 
+              fontweight='bold', fontsize=18)
+    
+    # Set x-axis labels
+    plt.xticks(x_pos, [name for name, _ in test_distance_fns], 
+               fontsize=14, fontweight='bold')
+    plt.yticks(fontsize=14)
+    
+    # Add legend
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=12)
+    
+    # Add grid
+    plt.grid(axis='y', alpha=0.3, linestyle='--')
+    
+    plt.tight_layout()
+    plt.savefig(f"{DATASET}_noise_multiplier_sweep_bar_chart.png", dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # Alternative visualization with all noise means (heatmap style bar chart)
+    plt.figure(figsize=(25, 10))
+    
+    # Create a more detailed bar chart with more noise means (every 0.2)
+    detailed_noise_indices = [i for i, nm in enumerate(noise_means) if nm % 0.2 == 0]
+    detailed_noise_means = noise_means[detailed_noise_indices]
+    detailed_mean_results = mean_results[detailed_noise_indices, :]
+    detailed_std_results = std_results[detailed_noise_indices, :]
+    
+    colors_detailed = plt.cm.coolwarm(np.linspace(0, 1, len(detailed_noise_means)))
+    
+    bar_width_detailed = 0.05
+    
+    for i, (noise_mean, color) in enumerate(zip(detailed_noise_means, colors_detailed)):
+        accuracies = detailed_mean_results[i, :]
+        errors = detailed_std_results[i, :]
+        
+        valid_mask = ~np.isnan(accuracies)
+        if np.any(valid_mask):
+            positions = x_pos + i * bar_width_detailed - (len(detailed_noise_means) - 1) * bar_width_detailed / 2
+            
+            plt.bar(positions[valid_mask], accuracies[valid_mask], 
+                   width=bar_width_detailed, color=color, alpha=0.8,
+                   edgecolor='none')
+    
+    plt.xlabel('Distance Metric', fontweight='bold', fontsize=16)
+    plt.ylabel('Accuracy (%)', fontweight='bold', fontsize=16)
+    plt.title(f'Detailed Performance vs Noise Multiplier Mean\n(std={noise_multiplier_std})', 
+              fontweight='bold', fontsize=18)
+    
+    plt.xticks(x_pos, [name for name, _ in test_distance_fns], 
+               fontsize=14, fontweight='bold')
+    plt.yticks(fontsize=14)
+    
+    # Add colorbar to show noise mean values
+    sm = plt.cm.ScalarMappable(cmap='coolwarm', 
+                              norm=plt.Normalize(vmin=detailed_noise_means.min(), 
+                                               vmax=detailed_noise_means.max()))
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=plt.gca())
+    cbar.set_label('Noise Multiplier Mean', fontweight='bold', fontsize=14)
+    
+    plt.grid(axis='y', alpha=0.3, linestyle='--')
+    plt.tight_layout()
+    plt.savefig(f"{DATASET}_noise_multiplier_sweep_detailed_bar_chart.png", dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # Statistical analysis and summary
+    print("\n=== Experiment Summary ===")
+    
+    # Find best noise mean for each distance metric
+    best_settings = {}
+    for j, (test_name, _) in enumerate(test_distance_fns):
+        valid_mask = ~np.isnan(mean_results[:, j])
+        if np.any(valid_mask):
+            valid_indices = np.where(valid_mask)[0]
+            valid_means = mean_results[valid_mask, j]
+            best_idx_in_valid = np.argmax(valid_means)
+            best_idx_overall = valid_indices[best_idx_in_valid]
+            
+            best_noise_mean = noise_means[best_idx_overall]
+            best_acc = mean_results[best_idx_overall, j]
+            best_std = std_results[best_idx_overall, j]
+            
+            best_settings[test_name] = {
+                'noise_mean': best_noise_mean,
+                'accuracy': best_acc,
+                'std': best_std
+            }
+            
+            print(f"\n{test_name}:")
+            print(f"  Best noise mean: {best_noise_mean:.1f}")
+            print(f"  Best accuracy: {best_acc:.2f}% ± {best_std:.2f}%")
+    
+    # Save best settings
+    best_settings_df = pd.DataFrame.from_dict(best_settings, orient='index')
+    best_settings_df.to_csv(f"{DATASET}_noise_multiplier_best_settings.csv")
+    
+    # Find global best setting
+    all_valid_accs = mean_results[~np.isnan(mean_results)]
+    if len(all_valid_accs) > 0:
+        global_best_idx = np.unravel_index(np.nanargmax(mean_results), mean_results.shape)
+        global_best_noise_mean = noise_means[global_best_idx[0]]
+        global_best_metric = test_distance_fns[global_best_idx[1]][0]
+        global_best_acc = mean_results[global_best_idx]
+        global_best_std = std_results[global_best_idx]
+        
+        print(f"\nGlobal best setting:")
+        print(f"  Noise mean: {global_best_noise_mean:.1f}")
+        print(f"  Test metric: {global_best_metric}")
+        print(f"  Accuracy: {global_best_acc:.2f}% ± {global_best_std:.2f}%")
+    
+    print(f"\nDetailed results saved to:")
+    print(f"  - {DATASET}_noise_multiplier_sweep.npz")
+    print(f"  - {DATASET}_noise_multiplier_sweep_detailed_results.csv")
+    print(f"  - {DATASET}_noise_multiplier_best_settings.csv")
+    
+    return all_results, mean_results, std_results, noise_means, best_settings
 # -------------------------------
 # 主程式
 # -------------------------------
 if __name__ == "__main__":
     experiment_training_methods_comparison()
+    # experiment_snr_analysis()
+    # experiment_noise_multiplier_sweep()
     print("所有實驗、比較和可視化已完成！")
