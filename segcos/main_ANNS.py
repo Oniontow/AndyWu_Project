@@ -8,6 +8,8 @@ import os
 import torch
 from torch.utils.data import DataLoader
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 plt.switch_backend('Agg')
 def process_args():
     parser = argparse.ArgumentParser()  # Create a new argument parser.
@@ -51,6 +53,9 @@ def process_args():
 
     #Subset
     parser.add_argument("--num_subset", type=int, default=50000, help="")
+    parser.add_argument("--grid_workers", type=int, default=1, help="Number of workers for parallel grid search in find_best_recall")
+    parser.add_argument("--grid_gpu_ids", type=str, default=None, help="Comma-separated CUDA GPU ids for parallel grid search, e.g. 1,2")
+    parser.add_argument("--grid_csv_path", type=str, default=None, help="Optional CSV path for grid search results")
     
 
     return parser.parse_args()  # Parse the arguments from the command line.
@@ -58,7 +63,10 @@ def process_args():
 
 class SupportSetDataset():
     def __init__(self, support_set):
-        self.support_set = torch.tensor(support_set, dtype=torch.float32)
+        if torch.is_tensor(support_set):
+            self.support_set = support_set.to(dtype=torch.float32)
+        else:
+            self.support_set = torch.tensor(support_set, dtype=torch.float32)
 
     def __len__(self):
         return len(self.support_set)
@@ -476,9 +484,9 @@ def do_compute_segmented_cosine(support_loader, query_vector, topk=1000, scale=N
             segment_upper_estimate = segment_upper_estimate * division
 
         elif(args.option == "Seg-Cos_TCAM"):
-            print(query_segment[0,1:3])
-            print(query_segment[53,1:3])
-            print(query_segment[23,1:3])
+            # print(query_segment[0,1:3])
+            # print(query_segment[53,1:3])
+            # print(query_segment[23,1:3])
             division = 2*math.pi/args.N
             angle_query_segment   = torch.atan2(  query_segment[:,:,1],   query_segment[:,:,0])
             angle_support_segment = torch.atan2(support_segment[:,:,1], support_segment[:,:,0])
@@ -719,9 +727,7 @@ def main():
     else:
         inference()
 
-def inference():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("device:", device)
+def get_dataset_file_path():
     if args.dataset == "glove-25":
         file_path = './GloVe/glove-25-angular.hdf5'
     elif args.dataset == "glove-50":
@@ -742,6 +748,144 @@ def inference():
         file_path = './COCO-T2I/coco-t2i-512-angular.hdf5'
     else:
         file_path = f"./{args.dataset}/{args.dataset}_{args.num_subset}.hdf5"
+    return file_path
+
+def _to_float(value):
+    if torch.is_tensor(value):
+        return float(value.detach().cpu().item())
+    return float(value)
+
+def parse_grid_gpu_ids(grid_gpu_ids):
+    if grid_gpu_ids is None:
+        return None
+    gpu_ids = []
+    for token in grid_gpu_ids.split(','):
+        token = token.strip()
+        if token == "":
+            continue
+        gpu_ids.append(int(token))
+    return gpu_ids if len(gpu_ids) > 0 else None
+
+def parse_visible_cuda_devices_from_env():
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if raw is None or raw.strip() == "":
+        return None
+    parsed = []
+    for token in raw.split(','):
+        token = token.strip()
+        if token == "":
+            continue
+        if token.startswith("GPU-") or token.startswith("MIG-"):
+            return None
+        try:
+            parsed.append(int(token))
+        except ValueError:
+            return None
+    return parsed if len(parsed) > 0 else None
+
+def resolve_worker_devices(grid_workers, grid_gpu_ids, default_device):
+    if grid_workers <= 1:
+        return [default_device]
+
+    if default_device.type != "cuda":
+        print("Warning: grid_workers > 1 but CUDA is unavailable, running workers on CPU.")
+        return [torch.device("cpu") for _ in range(grid_workers)]
+
+    visible_gpu_count = torch.cuda.device_count()
+    if grid_gpu_ids is None:
+        print("Warning: --grid_gpu_ids is not set; workers will share current CUDA device context.")
+        return [torch.device("cuda") for _ in range(grid_workers)]
+
+    as_visible_indices = all((gpu_id >= 0 and gpu_id < visible_gpu_count) for gpu_id in grid_gpu_ids)
+    if as_visible_indices:
+        devices = [torch.device(f"cuda:{gpu_id}") for gpu_id in grid_gpu_ids]
+        print("Parallel grid search worker devices (visible index mode):", [str(d) for d in devices])
+        return devices
+
+    visible_from_env = parse_visible_cuda_devices_from_env()
+    if visible_from_env is not None:
+        missing_ids = [gpu_id for gpu_id in grid_gpu_ids if gpu_id not in visible_from_env]
+        if len(missing_ids) == 0:
+            mapped_indices = [visible_from_env.index(gpu_id) for gpu_id in grid_gpu_ids]
+            devices = [torch.device(f"cuda:{idx}") for idx in mapped_indices]
+            print("Parallel grid search worker devices (physical id remap mode):", [str(d) for d in devices])
+            return devices
+
+        raise ValueError(
+            f"Requested --grid_gpu_ids {grid_gpu_ids}, but CUDA_VISIBLE_DEVICES={visible_from_env}. "
+            f"Unavailable ids: {missing_ids}. Use only visible physical ids, or adjust CUDA_VISIBLE_DEVICES."
+        )
+
+    raise ValueError(
+        f"Invalid --grid_gpu_ids {grid_gpu_ids}. Visible CUDA device indices are 0..{visible_gpu_count-1}. "
+        f"If you pass physical IDs, also set CUDA_VISIBLE_DEVICES accordingly (e.g. CUDA_VISIBLE_DEVICES=1,2 with --grid_gpu_ids 1,2)."
+    )
+
+def evaluate_grid_point(file_path, support_set_tensor, total_query_num, alpha, beta, device):
+    support_set_dataset = SupportSetDataset(support_set_tensor)
+    support_loader = DataLoader(support_set_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
+
+    counter = 0
+    recall = 0.0
+    average_similarity_array = []
+    average_difference_array = []
+    std_difference_array = []
+
+    while counter < total_query_num:
+        with h5py.File(file_path, 'r') as f:
+            test_set = torch.tensor(f['test'][counter : counter+args.query_num], dtype=torch.float32).to(device)
+            test_neighbors_id = f['neighbors'][counter : counter+args.query_num]
+
+        print("Processed query from", counter, "to", counter + test_set.shape[0] - 1, "for alpha", alpha, "beta", beta)
+
+        if args.similarity == "segmented_cosine":
+            result_id, average_similarity, average_difference, std_difference = do_compute_segmented_cosine(
+                support_loader,
+                test_set,
+                topk=args.topk,
+                scale=(1 / alpha),
+                minimum=beta
+            )
+        elif args.similarity == "L1norm":
+            result_id, average_similarity, average_difference, std_difference = do_compute_L1norm(
+                support_loader,
+                test_set,
+                topk=args.topk,
+                clamp_ratio=beta
+            )
+        else:
+            raise ValueError("find_best_recall only supports segmented_cosine or L1norm")
+
+        average_similarity_array.append(_to_float(average_similarity))
+        average_difference_array.append(_to_float(average_difference))
+        std_difference_array.append(_to_float(std_difference))
+
+        for i in range(test_set.shape[0]):
+            intersection = torch.isin(result_id[i], torch.tensor(test_neighbors_id[i], device=result_id.device))
+            recall += intersection.sum().item() / len(test_neighbors_id[i])
+
+        counter += args.query_num
+
+    total_average_similarity = float(np.mean(average_similarity_array))
+    total_average_difference = float(np.mean(average_difference_array))
+    std_difference_array = np.array(std_difference_array, dtype=np.float64)
+    average_difference_array = np.array(average_difference_array, dtype=np.float64)
+    total_std_difference = float(np.sqrt(np.mean((std_difference_array ** 2) + ((average_difference_array - total_average_difference) ** 2))))
+    ave_recall = float(recall / total_query_num)
+
+    return {
+        "alpha": float(alpha),
+        "beta": float(beta),
+        "recall": ave_recall,
+        "average_difference": total_average_difference,
+        "std_difference": total_std_difference,
+        "average_similarity": total_average_similarity,
+    }
+
+def inference():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("device:", device)
+    file_path = get_dataset_file_path()
 
     total_query_num = args.total_query_num
     with h5py.File(file_path, 'r') as f:
@@ -814,35 +958,17 @@ def inference():
 def find_best_recall():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
-    if args.dataset == "glove-25":
-        file_path = './GloVe/glove-25-angular.hdf5'
-    elif args.dataset == "glove-50":
-        file_path = './GloVe/glove-50-angular.hdf5'
-    elif args.dataset == "glove-100":
-        file_path = './GloVe/glove-100-angular.hdf5'
-    elif args.dataset == "glove-200":
-        file_path = './GloVe/glove-200-angular.hdf5'
-    elif args.dataset == "NYTimes":
-        file_path = './NYTimes/nytimes-256-angular.hdf5'
-    elif args.dataset == "DEEP1B":
-        file_path = './DEEP1B/deep-image-96-angular.hdf5'
-    elif args.dataset == "Last.fm":
-        file_path = './Last.fm/lastfm-64-dot.hdf5'
-    elif args.dataset == "COCO-I2I":
-        file_path = './COCO-I2I/coco-i2i-512-angular.hdf5'
-    elif args.dataset == "COCO-T2I":
-        file_path = './COCO-T2I/coco-t2i-512-angular.hdf5'
-    else:
-        file_path = f"./{args.dataset}/{args.dataset}_{args.num_subset}.hdf5"
+    file_path = get_dataset_file_path()
+
+    grid_gpu_ids = parse_grid_gpu_ids(args.grid_gpu_ids)
+    worker_devices = resolve_worker_devices(args.grid_workers, grid_gpu_ids, device)
 
     total_query_num = args.total_query_num
     with h5py.File(file_path, 'r') as f:
         print("Query Set shape:", f['test'].shape)
         if total_query_num == 0:
             total_query_num = f['test'].shape[0]
-        support_set_dataset = SupportSetDataset(f['train'][:])
-        batch_size = args.batch_size
-        support_loader = DataLoader(support_set_dataset, batch_size=batch_size, shuffle=False, num_workers=8)
+        support_set_tensor = torch.tensor(f['train'][:], dtype=torch.float32)
         print("Query Label shape:", f['neighbors'].shape)
         print("Support Set shape:", f['train'].shape)
 
@@ -866,95 +992,91 @@ def find_best_recall():
     # beta_end    = 3.14
     # beta_step   = 0.1
 
-    for alpha in torch.arange(alpha_start, alpha_end, alpha_step):
-        alpha = alpha.item()
+    all_grid_results = []
+    alpha_values = [a.item() for a in torch.arange(alpha_start, alpha_end, alpha_step)]
+    beta_values = [b.item() for b in torch.arange(beta_start, beta_end, beta_step)]
+
+    if args.grid_workers > 1 and device.type == "cuda" and (grid_gpu_ids is None or len(grid_gpu_ids) <= 1):
+        print("Warning: Running parallel grid search on single CUDA device may increase memory usage and can be slower.")
+
+    for alpha in alpha_values:
         tmp_best_alpha  = None
         tmp_best_beta   = None
         tmp_best_recall = 0
+        alpha_results = []
 
-        early_stop = 0
+        if args.grid_workers > 1:
+            actual_workers = min(args.grid_workers, len(beta_values))
+            print(f"Parallel grid search: alpha={alpha}, workers={actual_workers}")
+            with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+                futures = {}
+                for beta_index, beta in enumerate(beta_values):
+                    worker_device = worker_devices[beta_index % len(worker_devices)]
+                    future = executor.submit(
+                        evaluate_grid_point,
+                        file_path,
+                        support_set_tensor,
+                        total_query_num,
+                        alpha,
+                        beta,
+                        worker_device
+                    )
+                    futures[future] = beta
+                for future in as_completed(futures):
+                    result = future.result()
+                    alpha_results.append(result)
+                    print("Recall:", result["recall"], "with alpha:", result["alpha"], "with beta:", result["beta"])
+                    print("Difference:", result["average_difference"], result["std_difference"])
+                    print("Similarity:", result["average_similarity"])
+        else:
+            early_stop = 0
+            last_time_recall = -1
+            for beta in beta_values:
+                print("Alpha:", alpha, "Beta:", beta)
+                result = evaluate_grid_point(file_path, support_set_tensor, total_query_num, alpha, beta, device)
+                alpha_results.append(result)
 
-        for beta in torch.arange(beta_start, beta_end, beta_step):
-            beta = beta.item()
-            print("Alpha:", alpha, "Beta:", beta)
+                ave_recall = result["recall"]
+                print("Recall:", result["recall"], "with alpha:", result["alpha"], "with beta:", result["beta"])
+                print("Difference:", result["average_difference"], result["std_difference"])
+                print("Similarity:", result["average_similarity"])
 
-            counter = 0
-            recall = 0
-
-            while counter < total_query_num:
-                with h5py.File(file_path, 'r') as f:
-                    test_set = torch.tensor(f['test'][counter : counter+args.query_num], dtype=torch.float32).to(device)
-                    test_neighbors_id = f['neighbors'][counter : counter+args.query_num]
-
-                print("Processed query from", counter, "to", counter + test_set.shape[0] - 1)
-
-                if args.similarity == "segmented_cosine":
-                    result_id, average_similarity, average_difference, std_difference = do_compute_segmented_cosine(support_loader, test_set, topk=args.topk, scale=(1 / alpha), minimum=beta)
-                elif args.similarity == "L1norm":
-                    result_id, average_similarity, average_difference, std_difference = do_compute_L1norm(support_loader, test_set, topk=args.topk, clamp_ratio = beta)
-                average_similarity_array = []
-                average_difference_array = []
-                std_difference_array     = []
-
-                average_similarity_array.append(average_similarity)
-                average_difference_array.append(average_difference)
-                std_difference_array.append(std_difference)
-
-                for i in range(test_set.shape[0]):
-                    # print("Query ID:", i, "Query Label:", test_neighbors_id[i])
-                    # print("Result ID:", result_id[i])
-                    intersection = torch.isin(result_id[i], torch.tensor(test_neighbors_id[i], device=result_id.device))
-                    # print("Intersection:", intersection.sum())
-                    recall += intersection.sum().item() / len(test_neighbors_id[i])
-
-                counter += args.query_num
-
-            average_similarity = torch.tensor(average_similarity_array, device=device)
-            total_average_similarity = torch.mean(average_similarity)
-            average_difference = torch.tensor(average_difference_array, device=device)
-            total_average_difference = torch.mean(average_difference)
-            std_difference = torch.tensor(std_difference_array, device=device)
-            total_std_difference =  torch.sqrt(torch.mean((std_difference**2) + (average_difference - total_average_difference)**2))
-
-            ave_recall = recall / total_query_num
-
-            print("Recall:", ave_recall, "with alpha:", alpha, "with beta:", beta)
-            print("Difference:", total_average_difference, total_std_difference)
-            print("Similarity:", total_average_similarity)
-
-            if ave_recall >= tmp_best_recall:
-                early_stop = 0
-                tmp_best_recall = ave_recall
-                tmp_best_alpha = alpha
-                tmp_best_beta = beta
-                tmp_average_difference = total_average_difference
-                tmp_std_difference     = total_std_difference
-                tmp_average_similarity = total_average_similarity
-                # print("Temporal Best recall:", tmp_best_recall, "with alpha:", tmp_best_alpha, "with beta:", tmp_best_beta)
-                if beta == beta_end:
-                    print("##############################################################")
-                    print("Temporal Best recall:", tmp_best_recall, "with alpha:", tmp_best_alpha, "with beta:", tmp_best_beta)
-                    print("Difference:", tmp_average_difference, tmp_std_difference)
-                    print("Similarity:", tmp_average_similarity)
-                    print("##############################################################")
-                
-                last_time_recall = ave_recall
-
-            else:
-                if ave_recall < last_time_recall:   
-                    early_stop += 1
-                else:
+                if ave_recall >= tmp_best_recall:
                     early_stop = 0
-                last_time_recall = ave_recall
-                if early_stop >= 2:
-                    print("##############################################################")
-                    print("Temporal Best recall:", tmp_best_recall, "with alpha:", tmp_best_alpha, "with beta:", tmp_best_beta)
-                    print("Difference:", tmp_average_difference, tmp_std_difference)
-                    print("Similarity:", tmp_average_similarity)
-                    print("##############################################################")
-                    break
+                    tmp_best_recall = ave_recall
+                    tmp_best_alpha = alpha
+                    tmp_best_beta = beta
+                    tmp_average_difference = result["average_difference"]
+                    tmp_std_difference     = result["std_difference"]
+                    tmp_average_similarity = result["average_similarity"]
+                    last_time_recall = ave_recall
                 else:
-                    print("Early stop count:", early_stop, "with alpha:", alpha, "with beta:", beta)
+                    if ave_recall < last_time_recall:
+                        early_stop += 1
+                    else:
+                        early_stop = 0
+                    last_time_recall = ave_recall
+                    if early_stop >= 2:
+                        print("##############################################################")
+                        print("Temporal Best recall:", tmp_best_recall, "with alpha:", tmp_best_alpha, "with beta:", tmp_best_beta)
+                        print("Difference:", tmp_average_difference, tmp_std_difference)
+                        print("Similarity:", tmp_average_similarity)
+                        print("##############################################################")
+                        break
+                    else:
+                        print("Early stop count:", early_stop, "with alpha:", alpha, "with beta:", beta)
+
+        alpha_results = sorted(alpha_results, key=lambda x: x["beta"])
+        all_grid_results.extend(alpha_results)
+
+        if args.grid_workers > 1 and len(alpha_results) > 0:
+            alpha_best = max(alpha_results, key=lambda x: x["recall"])
+            tmp_best_recall = alpha_best["recall"]
+            tmp_best_alpha = alpha_best["alpha"]
+            tmp_best_beta = alpha_best["beta"]
+            tmp_average_difference = alpha_best["average_difference"]
+            tmp_std_difference = alpha_best["std_difference"]
+            tmp_average_similarity = alpha_best["average_similarity"]
             
         if tmp_best_recall >= best_recall:
             best_recall = tmp_best_recall
@@ -978,6 +1100,18 @@ def find_best_recall():
 
         if args.option != "TLE":
             break
+
+    if not args.no_store_result:
+        if args.grid_csv_path is not None:
+            csv_path = args.grid_csv_path
+        else:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            csv_path = f"grid_search_{args.dataset}_{args.option}_{timestamp}.csv"
+        result_df = pd.DataFrame(all_grid_results)
+        if not result_df.empty:
+            result_df = result_df.sort_values(by=["alpha", "beta"]).reset_index(drop=True)
+        result_df.to_csv(csv_path, index=False)
+        print("Grid search results saved to:", csv_path)
     
 if __name__ == '__main__':
     args = process_args()
