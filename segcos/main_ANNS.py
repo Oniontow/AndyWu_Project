@@ -14,7 +14,7 @@ plt.switch_backend('Agg')
 def process_args():
     parser = argparse.ArgumentParser()  # Create a new argument parser.
     
-    parser.add_argument("--dataset", default="deep1M", help="The dataset name", choices=['DEEP1B', 'Last.fm', 'COCO-I2I', 'COCO-T2I', 'NYTimes', 'glove-25', 'glove-50', 'glove-100', 'glove-200'])  # Name of the dataset
+    parser.add_argument("--dataset", default="deep1M", help="The dataset name", choices=['DEEP1B', 'Last.fm', 'COCO-I2I', 'COCO-T2I', 'NYTimes', 'glove-25', 'glove-50', 'glove-100', 'glove-200', 'omniglot-128', 'omniglot-256'])  # Name of the dataset
     parser.add_argument("--similarity",  help="", choices=['L1norm', 'cosine', 'segmented_cosine', 'LSH'])  # Name of the dataset.
     parser.add_argument("--query_num", type=int, default=1,  help="")  
     parser.add_argument("--total_query_num", type=int, default=0,  help="")  
@@ -746,9 +746,35 @@ def get_dataset_file_path():
         file_path = './COCO-I2I/coco-i2i-512-angular.hdf5'
     elif args.dataset == "COCO-T2I":
         file_path = './COCO-T2I/coco-t2i-512-angular.hdf5'
+    elif args.dataset == "omniglot-128":
+        file_path = './omniglot/omniglot-128-angular.hdf5'
+    elif args.dataset == "omniglot-256":
+        file_path = './omniglot/omniglot-256-angular.hdf5'
     else:
         file_path = f"./{args.dataset}/{args.dataset}_{args.num_subset}.hdf5"
     return file_path
+
+def validate_dataset_shape(f):
+    expected_shapes = {
+        "omniglot-128": {"train": (19280, 128), "test": (13180, 128)},
+        "omniglot-256": {"train": (19280, 256), "test": (13180, 256)},
+    }
+
+    expected = expected_shapes.get(args.dataset)
+    if expected is None:
+        return
+
+    train_shape = tuple(f['train'].shape)
+    test_shape = tuple(f['test'].shape)
+    expected_train = expected["train"]
+    expected_test = expected["test"]
+
+    if train_shape != expected_train or test_shape != expected_test:
+        raise ValueError(
+            f"Dataset shape mismatch for {args.dataset}: "
+            f"train={train_shape}, test={test_shape}, "
+            f"expected train={expected_train}, expected test={expected_test}."
+        )
 
 def _to_float(value):
     if torch.is_tensor(value):
@@ -889,6 +915,7 @@ def inference():
 
     total_query_num = args.total_query_num
     with h5py.File(file_path, 'r') as f:
+        validate_dataset_shape(f)
         print("Query Set shape:", f['test'].shape)
         if total_query_num == 0:
             total_query_num = f['test'].shape[0]
@@ -965,6 +992,7 @@ def find_best_recall():
 
     total_query_num = args.total_query_num
     with h5py.File(file_path, 'r') as f:
+        validate_dataset_shape(f)
         print("Query Set shape:", f['test'].shape)
         if total_query_num == 0:
             total_query_num = f['test'].shape[0]
